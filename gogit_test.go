@@ -23,8 +23,17 @@ var testSignature = &object.Signature{
 // TestGoGitEndToEnd stores a whole git repository in S3, reopens it from a
 // fresh filesystem instance and verifies history, then repacks.
 func TestGoGitEndToEnd(t *testing.T) {
+	for _, v := range fsVariants {
+		t.Run(v.name, func(t *testing.T) { testGoGitEndToEnd(t, v.opts) })
+	}
+}
+
+func testGoGitEndToEnd(t *testing.T, opts []s3fs.Option) {
 	client := newTestClient(t)
-	bfs := s3fs.New(client, testBucket, s3fs.WithPrefix("repos/demo.git"))
+	newFS := func() *s3fs.S3FS {
+		return s3fs.New(client, testBucket, append([]s3fs.Option{s3fs.WithPrefix("repos/demo.git")}, opts...)...)
+	}
+	bfs := newFS()
 
 	// init a repository whose object database lives in S3
 	st := filesystem.NewStorage(bfs, cache.NewObjectLRUDefault())
@@ -59,7 +68,7 @@ func TestGoGitEndToEnd(t *testing.T) {
 	}
 
 	// reopen the repository from scratch, backed by the same bucket
-	bfs2 := s3fs.New(client, testBucket, s3fs.WithPrefix("repos/demo.git"))
+	bfs2 := newFS()
 	st2 := filesystem.NewStorage(bfs2, cache.NewObjectLRUDefault())
 	repo2, err := git.Open(st2, memfs.New())
 	if err != nil {
@@ -117,7 +126,7 @@ func TestGoGitEndToEnd(t *testing.T) {
 		t.Fatalf("repack: %v", err)
 	}
 
-	bfs3 := s3fs.New(client, testBucket, s3fs.WithPrefix("repos/demo.git"))
+	bfs3 := newFS()
 	st3 := filesystem.NewStorage(bfs3, cache.NewObjectLRUDefault())
 	repo3, err := git.Open(st3, memfs.New())
 	if err != nil {
@@ -145,14 +154,23 @@ func TestGoGitEndToEnd(t *testing.T) {
 
 // TestGoGitBare verifies a bare repository can be initialized and reopened.
 func TestGoGitBare(t *testing.T) {
+	for _, v := range fsVariants {
+		t.Run(v.name, func(t *testing.T) { testGoGitBare(t, v.opts) })
+	}
+}
+
+func testGoGitBare(t *testing.T, opts []s3fs.Option) {
 	client := newTestClient(t)
-	bfs := s3fs.New(client, testBucket, s3fs.WithPrefix("bare.git"))
+	newFS := func() *s3fs.S3FS {
+		return s3fs.New(client, testBucket, append([]s3fs.Option{s3fs.WithPrefix("bare.git")}, opts...)...)
+	}
+	bfs := newFS()
 	st := filesystem.NewStorage(bfs, cache.NewObjectLRUDefault())
 	if _, err := git.Init(st); err != nil {
 		t.Fatalf("init bare: %v", err)
 	}
 
-	bfs2 := s3fs.New(client, testBucket, s3fs.WithPrefix("bare.git"))
+	bfs2 := newFS()
 	st2 := filesystem.NewStorage(bfs2, cache.NewObjectLRUDefault())
 	repo, err := git.Open(st2, nil)
 	if err != nil {

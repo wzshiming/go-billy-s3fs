@@ -7,6 +7,14 @@
 // object metadata. Writes are buffered in memory and uploaded on Close/Sync;
 // reads stream from S3 using ranged requests, so ReadAt is safe for
 // concurrent use as required by billy.File.
+//
+// An optional in-memory cache (WithCache) keeps object metadata, negative
+// lookups, directory existence and small object bodies local, cutting S3
+// round trips dramatically for read-heavy workloads such as go-git. The
+// cache is write-through: every mutation made through the same instance
+// updates it immediately, so read-after-write stays consistent. Writes made
+// by other clients are only observed after entries expire (the ttl given to
+// WithCache; a ttl of zero never expires and assumes a single writer).
 package s3fs
 
 import (
@@ -21,6 +29,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -74,6 +83,12 @@ type S3FS struct {
 	// writing it).
 	writesMu   sync.Mutex
 	openWrites map[string]*writeFile
+
+	// cache, when non-nil, is a local write-through layer over S3: it serves
+	// HeadObject results, negative lookups, directory existence and small
+	// object bodies, and is updated by every mutation done through this
+	// instance.
+	cache *objCache
 }
 
 var (
@@ -94,6 +109,20 @@ func WithPrefix(prefix string) Option {
 // WithContext sets the context used for all S3 requests.
 func WithContext(ctx context.Context) Option {
 	return func(s *S3FS) { s.ctx = ctx }
+}
+
+// WithCache enables a local in-memory cache holding up to maxBytes of
+// metadata and object bodies (bodies larger than maxBytes/8 always stream).
+// The cache is write-through for mutations made via this instance; ttl
+// bounds how long writes from other clients can stay invisible. A ttl <= 0
+// keeps entries forever, which is only safe when this instance is the sole
+// writer of the bucket prefix.
+func WithCache(maxBytes int64, ttl time.Duration) Option {
+	return func(s *S3FS) {
+		if maxBytes > 0 {
+			s.cache = newObjCache(maxBytes, ttl)
+		}
+	}
 }
 
 // New returns a billy filesystem stored in the given bucket.
@@ -172,10 +201,28 @@ func (s *S3FS) listPrefix(p string) string {
 }
 
 func (s *S3FS) head(key string) (*s3.HeadObjectOutput, error) {
-	return s.client.HeadObject(s.ctx, &s3.HeadObjectInput{
+	if s.cache != nil {
+		if e, ok := s.cache.lookup(key); ok {
+			if !e.exists {
+				return nil, &types.NotFound{}
+			}
+			if e.head != nil {
+				return e.head, nil
+			}
+		}
+	}
+	out, err := s.client.HeadObject(s.ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	})
+	if s.cache != nil {
+		if err == nil {
+			s.cache.store(key, true, out, nil)
+		} else if isNotFound(err) {
+			s.cache.store(key, false, nil, nil)
+		}
+	}
+	return out, err
 }
 
 func (s *S3FS) put(key string, data []byte, meta map[string]string) error {
@@ -185,6 +232,9 @@ func (s *S3FS) put(key string, data []byte, meta map[string]string) error {
 		Body:     bytes.NewReader(data),
 		Metadata: meta,
 	})
+	if err == nil && s.cache != nil {
+		s.cache.storeWrite(key, data, meta)
+	}
 	return err
 }
 
@@ -205,6 +255,9 @@ func (s *S3FS) delete(key string) error {
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	})
+	if err == nil && s.cache != nil {
+		s.cache.dropDeleted(key)
+	}
 	return err
 }
 
@@ -218,6 +271,9 @@ func (s *S3FS) copy(srcKey, dstKey string) error {
 		Key:        aws.String(dstKey),
 		CopySource: aws.String(s.bucket + "/" + strings.Join(segs, "/")),
 	})
+	if err == nil && s.cache != nil {
+		s.cache.storeCopied(srcKey, dstKey)
+	}
 	return err
 }
 
@@ -299,15 +355,25 @@ func (s *S3FS) dirExists(p string) (bool, error) {
 	if cleanPath(p) == "/" {
 		return true, nil
 	}
+	prefix := s.listPrefix(p)
+	if s.cache != nil {
+		if e, ok := s.cache.lookup(prefix); ok {
+			return e.exists, nil
+		}
+	}
 	out, err := s.client.ListObjectsV2(s.ctx, &s3.ListObjectsV2Input{
 		Bucket:  aws.String(s.bucket),
-		Prefix:  aws.String(s.listPrefix(p)),
+		Prefix:  aws.String(prefix),
 		MaxKeys: aws.Int32(1),
 	})
 	if err != nil {
 		return false, err
 	}
-	return len(out.Contents) > 0, nil
+	exists := len(out.Contents) > 0
+	if s.cache != nil {
+		s.cache.store(prefix, exists, nil, nil)
+	}
+	return exists, nil
 }
 
 // Create implements billy.Basic.
@@ -352,6 +418,11 @@ func (s *S3FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File
 	writable := flag&(os.O_WRONLY|os.O_RDWR) != 0
 	if h != nil {
 		if !writable {
+			if f, ok, err := s.cachedOpen(p, h); err != nil {
+				return nil, err
+			} else if ok {
+				return f, nil
+			}
 			return newReadFile(s, p, h), nil
 		}
 		var data []byte

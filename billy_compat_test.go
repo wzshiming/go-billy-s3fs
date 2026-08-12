@@ -10,6 +10,8 @@ import (
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-billy/v6/util"
+
+	s3fs "github.com/wzshiming/go-billy-s3fs"
 )
 
 // compatScenarios are conformance checks modeled after the go-billy test
@@ -416,6 +418,7 @@ func TestBillyCompat(t *testing.T) {
 	}{
 		{"memfs", func(t *testing.T) billy.Filesystem { return memfs.New() }},
 		{"s3fs", func(t *testing.T) billy.Filesystem { return newTestFS(t) }},
+		{"s3fs-cached", func(t *testing.T) billy.Filesystem { return newTestFS(t, s3fs.WithCache(64<<20, 0)) }},
 	}
 	for _, impl := range impls {
 		t.Run(impl.name, func(t *testing.T) {

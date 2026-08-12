@@ -49,6 +49,16 @@ func newTestFS(t *testing.T, opts ...s3fs.Option) *s3fs.S3FS {
 	return s3fs.New(newTestClient(t), testBucket, opts...)
 }
 
+// fsVariants are the option sets shared suites run against: the plain
+// filesystem and one with the local write-through cache enabled.
+var fsVariants = []struct {
+	name string
+	opts []s3fs.Option
+}{
+	{"plain", nil},
+	{"cached", []s3fs.Option{s3fs.WithCache(64<<20, 0)}},
+}
+
 func writeFull(t *testing.T, bfs billy.Filesystem, name, content string) {
 	t.Helper()
 	if err := util.WriteFile(bfs, name, []byte(content), 0o644); err != nil {

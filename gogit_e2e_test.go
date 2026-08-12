@@ -22,10 +22,16 @@ import (
 // repository stored in S3: push over receive-pack, then clone twice over
 // upload-pack, verifying content round-trips.
 func TestGoGitPushCloneE2E(t *testing.T) {
+	for _, v := range fsVariants {
+		t.Run(v.name, func(t *testing.T) { testGoGitPushCloneE2E(t, v.opts) })
+	}
+}
+
+func testGoGitPushCloneE2E(t *testing.T, opts []s3fs.Option) {
 	s3Client := newTestClient(t)
 
 	// bare remote repository living in S3
-	remoteFS := s3fs.New(s3Client, testBucket, s3fs.WithPrefix("remote.git"))
+	remoteFS := s3fs.New(s3Client, testBucket, append([]s3fs.Option{s3fs.WithPrefix("remote.git")}, opts...)...)
 	remoteStore := filesystem.NewStorage(remoteFS, cache.NewObjectLRUDefault())
 	if _, err := git.Init(remoteStore); err != nil {
 		t.Fatalf("init remote: %v", err)
