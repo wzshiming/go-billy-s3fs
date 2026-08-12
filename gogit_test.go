@@ -24,7 +24,7 @@ var testSignature = &object.Signature{
 // fresh filesystem instance and verifies history, then repacks.
 func TestGoGitEndToEnd(t *testing.T) {
 	for _, v := range fsVariants {
-		t.Run(v.name, func(t *testing.T) { testGoGitEndToEnd(t, v.opts) })
+		t.Run(v.name, func(t *testing.T) { testGoGitEndToEnd(t, v.opts(t)) })
 	}
 }
 
@@ -155,7 +155,7 @@ func testGoGitEndToEnd(t *testing.T, opts []s3fs.Option) {
 // TestGoGitBare verifies a bare repository can be initialized and reopened.
 func TestGoGitBare(t *testing.T) {
 	for _, v := range fsVariants {
-		t.Run(v.name, func(t *testing.T) { testGoGitBare(t, v.opts) })
+		t.Run(v.name, func(t *testing.T) { testGoGitBare(t, v.opts(t)) })
 	}
 }
 

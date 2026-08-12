@@ -23,7 +23,7 @@ import (
 // upload-pack, verifying content round-trips.
 func TestGoGitPushCloneE2E(t *testing.T) {
 	for _, v := range fsVariants {
-		t.Run(v.name, func(t *testing.T) { testGoGitPushCloneE2E(t, v.opts) })
+		t.Run(v.name, func(t *testing.T) { testGoGitPushCloneE2E(t, v.opts(t)) })
 	}
 }
 

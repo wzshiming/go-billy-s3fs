@@ -25,7 +25,15 @@ var benchVariants = []struct {
 	{"osfs", func(b *testing.B) billy.Filesystem { return osfs.New(b.TempDir()) }},
 	{"s3fs", func(b *testing.B) billy.Filesystem { return s3fs.New(newTestClient(b), testBucket) }},
 	{"s3fs-cached", func(b *testing.B) billy.Filesystem {
-		return s3fs.New(newTestClient(b), testBucket, s3fs.WithCache(64<<20, 0))
+		return s3fs.New(newTestClient(b), testBucket, s3fs.WithMemCache(64<<20, 0))
+	}},
+	{"s3fs-disk", func(b *testing.B) billy.Filesystem {
+		return newTestFS(b, s3fs.WithDiskCache(b.TempDir(), 256<<20, 0))
+	}},
+	{"s3fs-disk-spill", func(b *testing.B) billy.Filesystem {
+		// tiny memory cache forces every body through the disk tier and
+		// every write through a spill file
+		return newTestFS(b, s3fs.WithMemCache(4<<10, 0), s3fs.WithDiskCache(b.TempDir(), 256<<20, 0))
 	}},
 }
 
