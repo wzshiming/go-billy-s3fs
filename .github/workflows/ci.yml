@@ -39,3 +39,6 @@ jobs:
 
       - name: test
         run: go test -race -count=1 ./...
+
+      - name: benchmark
+        run: go test -run '^$' -bench . -benchmem -benchtime 10x ./...

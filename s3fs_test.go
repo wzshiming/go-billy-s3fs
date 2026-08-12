@@ -25,7 +25,7 @@ import (
 const testBucket = "test-bucket"
 
 // newTestClient starts an in-memory fake S3 server and returns a client for it.
-func newTestClient(t *testing.T) *s3.Client {
+func newTestClient(t testing.TB) *s3.Client {
 	t.Helper()
 	backend := s3mem.New()
 	if err := backend.CreateBucket(testBucket); err != nil {
@@ -44,9 +44,19 @@ func newTestClient(t *testing.T) *s3.Client {
 	})
 }
 
-func newTestFS(t *testing.T, opts ...s3fs.Option) *s3fs.S3FS {
+func newTestFS(t testing.TB, opts ...s3fs.Option) *s3fs.S3FS {
 	t.Helper()
 	return s3fs.New(newTestClient(t), testBucket, opts...)
+}
+
+// fsVariants are the option sets shared suites run against: the plain
+// filesystem and one with the local write-through cache enabled.
+var fsVariants = []struct {
+	name string
+	opts []s3fs.Option
+}{
+	{"plain", nil},
+	{"cached", []s3fs.Option{s3fs.WithCache(64<<20, 0)}},
 }
 
 func writeFull(t *testing.T, bfs billy.Filesystem, name, content string) {
