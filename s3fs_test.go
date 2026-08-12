@@ -50,13 +50,21 @@ func newTestFS(t testing.TB, opts ...s3fs.Option) *s3fs.S3FS {
 }
 
 // fsVariants are the option sets shared suites run against: the plain
-// filesystem and one with the local write-through cache enabled.
+// filesystem, the in-memory cache, the disk cache, and both together.
 var fsVariants = []struct {
 	name string
-	opts []s3fs.Option
+	opts func(tb testing.TB) []s3fs.Option
 }{
-	{"plain", nil},
-	{"cached", []s3fs.Option{s3fs.WithCache(64<<20, 0)}},
+	{"plain", func(testing.TB) []s3fs.Option { return nil }},
+	{"cached", func(testing.TB) []s3fs.Option {
+		return []s3fs.Option{s3fs.WithMemCache(64<<20, 0)}
+	}},
+	{"disk", func(tb testing.TB) []s3fs.Option {
+		return []s3fs.Option{s3fs.WithDiskCache(tb.TempDir(), 256<<20, 0)}
+	}},
+	{"cached+disk", func(tb testing.TB) []s3fs.Option {
+		return []s3fs.Option{s3fs.WithMemCache(64<<20, 0), s3fs.WithDiskCache(tb.TempDir(), 256<<20, 0)}
+	}},
 }
 
 func writeFull(t *testing.T, bfs billy.Filesystem, name, content string) {

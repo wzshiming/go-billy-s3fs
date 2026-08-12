@@ -418,7 +418,15 @@ func TestBillyCompat(t *testing.T) {
 	}{
 		{"memfs", func(t *testing.T) billy.Filesystem { return memfs.New() }},
 		{"s3fs", func(t *testing.T) billy.Filesystem { return newTestFS(t) }},
-		{"s3fs-cached", func(t *testing.T) billy.Filesystem { return newTestFS(t, s3fs.WithCache(64<<20, 0)) }},
+		{"s3fs-cached", func(t *testing.T) billy.Filesystem { return newTestFS(t, s3fs.WithMemCache(64<<20, 0)) }},
+		{"s3fs-disk", func(t *testing.T) billy.Filesystem {
+			return newTestFS(t, s3fs.WithDiskCache(t.TempDir(), 256<<20, 0))
+		}},
+		{"s3fs-disk-spill", func(t *testing.T) billy.Filesystem {
+			// tiny memory cache forces every body through the disk tier and
+			// every write through a spill file
+			return newTestFS(t, s3fs.WithMemCache(4<<10, 0), s3fs.WithDiskCache(t.TempDir(), 256<<20, 0))
+		}},
 	}
 	for _, impl := range impls {
 		t.Run(impl.name, func(t *testing.T) {

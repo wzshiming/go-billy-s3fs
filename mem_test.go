@@ -82,7 +82,7 @@ func (c *countingClient) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2
 // the filesystem, reads and stats are served without any S3 round trips.
 func TestCacheReadAfterWrite(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
-	bfs := s3fs.New(client, testBucket, s3fs.WithCache(64<<20, 0))
+	bfs := s3fs.New(client, testBucket, s3fs.WithMemCache(64<<20, 0))
 
 	writeFull(t, bfs, "dir/a.txt", "hello cache")
 
@@ -105,7 +105,7 @@ func TestCacheReadAfterWrite(t *testing.T) {
 // negative entry does not mask a later create.
 func TestCacheNegativeStat(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
-	bfs := s3fs.New(client, testBucket, s3fs.WithCache(64<<20, 0))
+	bfs := s3fs.New(client, testBucket, s3fs.WithMemCache(64<<20, 0))
 
 	if _, err := bfs.Stat("missing.txt"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("first stat err = %v", err)
@@ -126,7 +126,7 @@ func TestCacheNegativeStat(t *testing.T) {
 
 // TestCacheInvalidation verifies Rename and Remove keep the cache coherent.
 func TestCacheInvalidation(t *testing.T) {
-	bfs := newTestFS(t, s3fs.WithCache(64<<20, 0))
+	bfs := newTestFS(t, s3fs.WithMemCache(64<<20, 0))
 
 	writeFull(t, bfs, "a.txt", "v1")
 	_ = readFull(t, bfs, "a.txt") // populate body cache
@@ -165,7 +165,7 @@ func TestCacheTTL(t *testing.T) {
 	}
 
 	t.Run("zero ttl keeps entries", func(t *testing.T) {
-		bfs := s3fs.New(raw, testBucket, s3fs.WithPrefix("forever"), s3fs.WithCache(64<<20, 0))
+		bfs := s3fs.New(raw, testBucket, s3fs.WithPrefix("forever"), s3fs.WithMemCache(64<<20, 0))
 		writeFull(t, bfs, "f", "v1")
 		extPut(t, "forever/f", "v2") // bypasses this instance's cache
 		if got := readFull(t, bfs, "f"); got != "v1" {
@@ -174,7 +174,7 @@ func TestCacheTTL(t *testing.T) {
 	})
 
 	t.Run("expired entries refetch", func(t *testing.T) {
-		bfs := s3fs.New(raw, testBucket, s3fs.WithPrefix("expiring"), s3fs.WithCache(64<<20, time.Nanosecond))
+		bfs := s3fs.New(raw, testBucket, s3fs.WithPrefix("expiring"), s3fs.WithMemCache(64<<20, time.Nanosecond))
 		writeFull(t, bfs, "f", "v1")
 		extPut(t, "expiring/f", "v2")
 		time.Sleep(time.Millisecond) // let the entry expire
@@ -189,7 +189,7 @@ func TestCacheTTL(t *testing.T) {
 func TestCacheBigObjectStreams(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
 	// 4KiB budget: bodies over 512B always stream
-	bfs := s3fs.New(client, testBucket, s3fs.WithCache(4096, 0))
+	bfs := s3fs.New(client, testBucket, s3fs.WithMemCache(4096, 0))
 
 	big := strings.Repeat("x", 10_000)
 	writeFull(t, bfs, "big.bin", big)

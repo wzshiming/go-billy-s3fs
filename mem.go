@@ -17,10 +17,10 @@ import (
 // metadata-only entries still consume budget.
 const entryOverhead = 256
 
-// cacheEntry is the immutable cached state of one object key or directory
+// memEntry is the immutable cached state of one object key or directory
 // prefix (trailing "/"). exists reports whether the key was present; head is
 // set for object entries; data holds the body when it fit the cache.
-type cacheEntry struct {
+type memEntry struct {
 	key     string
 	exists  bool
 	head    *s3.HeadObjectOutput
@@ -31,35 +31,35 @@ type cacheEntry struct {
 	cost int64
 }
 
-// objCache is an LRU+TTL cache over HeadObject results, object bodies and
+// memCache is an LRU+TTL cache over HeadObject results, object bodies and
 // directory-existence checks for one S3FS instance. Entries are immutable;
 // updates replace them wholesale. Safe for concurrent use.
-type objCache struct {
+type memCache struct {
 	maxBytes int64
 	ttl      time.Duration
 
 	mu      sync.Mutex
-	entries map[string]*cacheEntry
+	entries map[string]*memEntry
 	lru     *list.List // front = most recently used
 	used    int64
 }
 
-func newObjCache(maxBytes int64, ttl time.Duration) *objCache {
-	return &objCache{
+func newMemCache(maxBytes int64, ttl time.Duration) *memCache {
+	return &memCache{
 		maxBytes: maxBytes,
 		ttl:      ttl,
-		entries:  make(map[string]*cacheEntry),
+		entries:  make(map[string]*memEntry),
 		lru:      list.New(),
 	}
 }
 
 // maxDataBytes is the largest object body the cache holds, keeping one big
 // object (e.g. a packfile) from evicting everything else.
-func (c *objCache) maxDataBytes() int64 { return c.maxBytes / 8 }
+func (c *memCache) maxDataBytes() int64 { return c.maxBytes / 8 }
 
 // lookup returns the entry for key, refreshing its LRU position. Expired
 // entries are dropped and reported as misses.
-func (c *objCache) lookup(key string) (*cacheEntry, bool) {
+func (c *memCache) lookup(key string) (*memEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e := c.entries[key]
@@ -74,13 +74,13 @@ func (c *objCache) lookup(key string) (*cacheEntry, bool) {
 	return e, true
 }
 
-func (e *cacheEntry) validLocked() bool {
+func (e *memEntry) validLocked() bool {
 	return e.expires.IsZero() || time.Now().Before(e.expires)
 }
 
 // store inserts or replaces the entry for key. data is copied; bodies larger
 // than maxDataBytes are dropped, keeping metadata only.
-func (c *objCache) store(key string, exists bool, head *s3.HeadObjectOutput, data []byte) {
+func (c *memCache) store(key string, exists bool, head *s3.HeadObjectOutput, data []byte) {
 	if data != nil {
 		if int64(len(data)) > c.maxDataBytes() {
 			data = nil
@@ -95,11 +95,11 @@ func (c *objCache) store(key string, exists bool, head *s3.HeadObjectOutput, dat
 	c.storeLocked(key, exists, head, data)
 }
 
-func (c *objCache) storeLocked(key string, exists bool, head *s3.HeadObjectOutput, data []byte) {
+func (c *memCache) storeLocked(key string, exists bool, head *s3.HeadObjectOutput, data []byte) {
 	if old := c.entries[key]; old != nil {
 		c.removeLocked(old)
 	}
-	e := &cacheEntry{
+	e := &memEntry{
 		key:    key,
 		exists: exists,
 		head:   head,
@@ -120,11 +120,11 @@ func (c *objCache) storeLocked(key string, exists bool, head *s3.HeadObjectOutpu
 		if back == nil {
 			break
 		}
-		c.removeLocked(back.Value.(*cacheEntry))
+		c.removeLocked(back.Value.(*memEntry))
 	}
 }
 
-func (c *objCache) removeLocked(e *cacheEntry) {
+func (c *memCache) removeLocked(e *memEntry) {
 	if c.entries[e.key] == e {
 		delete(c.entries, e.key)
 	}
@@ -136,17 +136,21 @@ func (c *objCache) removeLocked(e *cacheEntry) {
 }
 
 // storeWrite records a successful PUT of key: the entry becomes the freshly
-// written object and every ancestor directory is known to exist.
-func (c *objCache) storeWrite(key string, data []byte, meta map[string]string) {
+// written object and every ancestor directory is known to exist. data may
+// be nil when the body is not to be cached (e.g. it lives in a spill file).
+func (c *memCache) storeWrite(key string, size int64, etag string, data []byte, meta map[string]string) {
 	var body []byte
-	if int64(len(data)) <= c.maxDataBytes() {
+	if data != nil && int64(len(data)) <= c.maxDataBytes() {
 		body = make([]byte, len(data))
 		copy(body, data)
 	}
 	head := &s3.HeadObjectOutput{
-		ContentLength: aws.Int64(int64(len(data))),
+		ContentLength: aws.Int64(size),
 		LastModified:  aws.Time(time.Now()),
 		Metadata:      meta,
+	}
+	if etag != "" {
+		head.ETag = aws.String(etag)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -156,7 +160,7 @@ func (c *objCache) storeWrite(key string, data []byte, meta map[string]string) {
 
 // storeCopied records a successful server-side copy: dst now exists, with
 // the source's cached state when available.
-func (c *objCache) storeCopied(srcKey, dstKey string) {
+func (c *memCache) storeCopied(srcKey, dstKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if src := c.entries[srcKey]; src != nil && src.exists && src.validLocked() && src.head != nil {
@@ -169,7 +173,7 @@ func (c *objCache) storeCopied(srcKey, dstKey string) {
 
 // dropDeleted invalidates key and its ancestor directory entries after a
 // delete; ancestors may have become empty.
-func (c *objCache) dropDeleted(key string) {
+func (c *memCache) dropDeleted(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e := c.entries[key]; e != nil {
@@ -186,7 +190,7 @@ func (c *objCache) dropDeleted(key string) {
 }
 
 // markDirsLocked records that every ancestor directory prefix of key exists.
-func (c *objCache) markDirsLocked(key string) {
+func (c *memCache) markDirsLocked(key string) {
 	for i := 0; i < len(key); i++ {
 		if key[i] != '/' {
 			continue
@@ -199,28 +203,34 @@ func (c *objCache) markDirsLocked(key string) {
 	}
 }
 
-// cachedOpen serves an O_RDONLY open from the cache, fetching bodies that
-// fit the cache on miss. ok=false means the caller should stream from S3.
+// cachedOpen serves an O_RDONLY open from the local tiers: the memory cache
+// for bodies that fit it, the disk cache for anything larger. ok=false
+// means the caller should stream from S3.
 func (s *S3FS) cachedOpen(p string, h *s3.HeadObjectOutput) (billy.File, bool, error) {
-	if s.cache == nil {
-		return nil, false, nil
-	}
+	size := aws.ToInt64(h.ContentLength)
 	key := s.key(p)
-	if e, ok := s.cache.lookup(key); ok && e.exists && e.data != nil {
-		return newMemReadFile(p, infoFromHeadValue(path.Base(p), h), e.data), true, nil
-	}
-	if aws.ToInt64(h.ContentLength) > s.cache.maxDataBytes() {
-		return nil, false, nil
-	}
-	data, err := s.getAll(key)
-	if err != nil {
-		if isNotFound(err) {
-			return nil, false, &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist}
+	if s.mem != nil && size <= s.mem.maxDataBytes() {
+		if e, ok := s.mem.lookup(key); ok && e.exists && e.data != nil {
+			return newMemReadFile(p, infoFromHeadValue(path.Base(p), h), e.data), true, nil
 		}
-		return nil, false, err
+		data, err := s.getAll(key)
+		if err != nil {
+			if isNotFound(err) {
+				return nil, false, &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist}
+			}
+			return nil, false, err
+		}
+		s.mem.store(key, true, h, data)
+		return newMemReadFile(p, infoFromHeadValue(path.Base(p), h), data), true, nil
 	}
-	s.cache.store(key, true, h, data)
-	return newMemReadFile(p, infoFromHeadValue(path.Base(p), h), data), true, nil
+	if s.disk != nil && size+entryOverhead <= s.disk.maxBytes {
+		if f, ok := s.disk.open(key, aws.ToString(h.ETag)); ok {
+			info := infoFromHeadValue(path.Base(p), h)
+			return newDiskReadFile(f, p, info), true, nil
+		}
+		return s.diskFetch(key, h, p)
+	}
+	return nil, false, nil
 }
 
 // memReadFile is a read-only billy.File over a cached object body. data is

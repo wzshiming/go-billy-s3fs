@@ -8,13 +8,20 @@
 // reads stream from S3 using ranged requests, so ReadAt is safe for
 // concurrent use as required by billy.File.
 //
-// An optional in-memory cache (WithCache) keeps object metadata, negative
-// lookups, directory existence and small object bodies local, cutting S3
-// round trips dramatically for read-heavy workloads such as go-git. The
-// cache is write-through: every mutation made through the same instance
-// updates it immediately, so read-after-write stays consistent. Writes made
-// by other clients are only observed after entries expire (the ttl given to
-// WithCache; a ttl of zero never expires and assumes a single writer).
+// An optional in-memory cache (WithMemCache) keeps object metadata,
+// negative lookups, directory existence and small object bodies local,
+// cutting S3 round trips dramatically for read-heavy workloads such as
+// go-git. The cache is write-through: every mutation made through the same
+// instance updates it immediately, so read-after-write stays consistent.
+// Writes made by other clients are only observed after entries expire (the
+// ttl given to WithMemCache; a ttl of zero never expires and assumes a
+// single writer).
+//
+// An optional disk cache (WithDiskCache) extends caching to bodies too
+// large for memory: objects are downloaded once into local files, random
+// ReadAt is then served from disk, and large write buffers spill to disk
+// instead of RAM. Entries are validated by ETag, so overwrites by other
+// clients are detected on the next (fresh) HeadObject.
 package s3fs
 
 import (
@@ -84,11 +91,15 @@ type S3FS struct {
 	writesMu   sync.Mutex
 	openWrites map[string]*writeFile
 
-	// cache, when non-nil, is a local write-through layer over S3: it serves
+	// mem, when non-nil, is a local write-through layer over S3: it serves
 	// HeadObject results, negative lookups, directory existence and small
 	// object bodies, and is updated by every mutation done through this
 	// instance.
-	cache *objCache
+	mem *memCache
+
+	// disk, when non-nil, stores object bodies too large for the memory
+	// cache as local files and spills large write buffers to disk.
+	disk *diskCache
 }
 
 var (
@@ -111,16 +122,32 @@ func WithContext(ctx context.Context) Option {
 	return func(s *S3FS) { s.ctx = ctx }
 }
 
-// WithCache enables a local in-memory cache holding up to maxBytes of
+// WithMemCache enables a local in-memory cache holding up to maxBytes of
 // metadata and object bodies (bodies larger than maxBytes/8 always stream).
 // The cache is write-through for mutations made via this instance; ttl
 // bounds how long writes from other clients can stay invisible. A ttl <= 0
 // keeps entries forever, which is only safe when this instance is the sole
 // writer of the bucket prefix.
-func WithCache(maxBytes int64, ttl time.Duration) Option {
+func WithMemCache(maxBytes int64, ttl time.Duration) Option {
 	return func(s *S3FS) {
 		if maxBytes > 0 {
-			s.cache = newObjCache(maxBytes, ttl)
+			s.mem = newMemCache(maxBytes, ttl)
+		}
+	}
+}
+
+// WithDiskCache stores object bodies too large for the in-memory cache as
+// files under dir, holding up to maxBytes in total, and buffers large
+// writes in spill files instead of memory. Entries are validated by ETag on
+// every open, so overwrites are detected whenever a fresh HeadObject is
+// seen; ttl additionally bounds how long a body is kept before being
+// re-fetched, and a ttl <= 0 keeps entries until evicted. dir must be used
+// by a single process at a time; files left over from a previous run are
+// removed.
+func WithDiskCache(dir string, maxBytes int64, ttl time.Duration) Option {
+	return func(s *S3FS) {
+		if dir != "" && maxBytes > 0 {
+			s.disk = newDiskCache(dir, maxBytes, ttl)
 		}
 	}
 }
@@ -201,8 +228,8 @@ func (s *S3FS) listPrefix(p string) string {
 }
 
 func (s *S3FS) head(key string) (*s3.HeadObjectOutput, error) {
-	if s.cache != nil {
-		if e, ok := s.cache.lookup(key); ok {
+	if s.mem != nil {
+		if e, ok := s.mem.lookup(key); ok {
 			if !e.exists {
 				return nil, &types.NotFound{}
 			}
@@ -215,27 +242,73 @@ func (s *S3FS) head(key string) (*s3.HeadObjectOutput, error) {
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	})
-	if s.cache != nil {
+	if s.mem != nil {
 		if err == nil {
-			s.cache.store(key, true, out, nil)
+			s.mem.store(key, true, out, nil)
 		} else if isNotFound(err) {
-			s.cache.store(key, false, nil, nil)
+			s.mem.store(key, false, nil, nil)
 		}
 	}
 	return out, err
 }
 
 func (s *S3FS) put(key string, data []byte, meta map[string]string) error {
-	_, err := s.client.PutObject(s.ctx, &s3.PutObjectInput{
+	out, err := s.client.PutObject(s.ctx, &s3.PutObjectInput{
 		Bucket:   aws.String(s.bucket),
 		Key:      aws.String(key),
 		Body:     bytes.NewReader(data),
 		Metadata: meta,
 	})
-	if err == nil && s.cache != nil {
-		s.cache.storeWrite(key, data, meta)
+	if err != nil {
+		return err
 	}
-	return err
+	if s.mem != nil {
+		body := data
+		if body == nil {
+			body = []byte{}
+		}
+		s.mem.storeWrite(key, int64(len(data)), aws.ToString(out.ETag), body, meta)
+	}
+	if s.disk != nil {
+		s.disk.dropDeleted(key) // overwrite invalidates any cached body
+	}
+	return nil
+}
+
+// putSpill uploads a spilled write buffer, then adopts the file into the
+// disk cache so the next open needs no download.
+func (s *S3FS) putSpill(key string, fb *fileBuf, meta map[string]string) error {
+	if _, err := fb.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	out, err := s.client.PutObject(s.ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(key),
+		Body:          fb.f,
+		ContentLength: aws.Int64(fb.sz),
+		Metadata:      meta,
+	})
+	if err != nil {
+		return err
+	}
+	etag := aws.ToString(out.ETag)
+	if s.mem != nil {
+		s.mem.storeWrite(key, fb.sz, etag, nil, meta)
+	}
+	if s.disk != nil {
+		s.disk.dropDeleted(key)
+		s.disk.adopt(key, etag, fb.path, fb.sz)
+	}
+	return nil
+}
+
+// spillThreshold is the write-buffer size above which contents move to a
+// spill file when the disk cache is enabled.
+func (s *S3FS) spillThreshold() int64 {
+	if s.mem != nil {
+		return s.mem.maxDataBytes()
+	}
+	return defaultSpillLimit
 }
 
 func (s *S3FS) getAll(key string) ([]byte, error) {
@@ -250,13 +323,54 @@ func (s *S3FS) getAll(key string) ([]byte, error) {
 	return io.ReadAll(out.Body)
 }
 
+// bufForExisting loads the current contents of p for a read-modify-write
+// open: into memory when small, streamed into a spill file when the disk
+// cache is enabled and the object is large.
+func (s *S3FS) bufForExisting(p string, h *s3.HeadObjectOutput) (writeBuf, error) {
+	key := s.key(p)
+	if s.disk == nil || aws.ToInt64(h.ContentLength) <= s.spillThreshold() {
+		data, err := s.getAll(key)
+		if err != nil {
+			return nil, err
+		}
+		return &memBuf{data: data}, nil
+	}
+	fb, err := s.disk.newSpill()
+	if err != nil {
+		data, gerr := s.getAll(key) // disk unusable; fall back to memory
+		if gerr != nil {
+			return nil, gerr
+		}
+		return &memBuf{data: data}, nil
+	}
+	out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		fb.destroy()
+		return nil, err
+	}
+	defer out.Body.Close()
+	n, err := io.Copy(fb.f, out.Body)
+	if err != nil {
+		fb.destroy()
+		return nil, err
+	}
+	fb.sz = n
+	return fb, nil
+}
+
 func (s *S3FS) delete(key string) error {
 	_, err := s.client.DeleteObject(s.ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	})
-	if err == nil && s.cache != nil {
-		s.cache.dropDeleted(key)
+	if err == nil && s.mem != nil {
+		s.mem.dropDeleted(key)
+	}
+	if err == nil && s.disk != nil {
+		s.disk.dropDeleted(key)
 	}
 	return err
 }
@@ -271,8 +385,11 @@ func (s *S3FS) copy(srcKey, dstKey string) error {
 		Key:        aws.String(dstKey),
 		CopySource: aws.String(s.bucket + "/" + strings.Join(segs, "/")),
 	})
-	if err == nil && s.cache != nil {
-		s.cache.storeCopied(srcKey, dstKey)
+	if err == nil && s.mem != nil {
+		s.mem.storeCopied(srcKey, dstKey)
+	}
+	if err == nil && s.disk != nil {
+		s.disk.copied(srcKey, dstKey)
 	}
 	return err
 }
@@ -356,8 +473,8 @@ func (s *S3FS) dirExists(p string) (bool, error) {
 		return true, nil
 	}
 	prefix := s.listPrefix(p)
-	if s.cache != nil {
-		if e, ok := s.cache.lookup(prefix); ok {
+	if s.mem != nil {
+		if e, ok := s.mem.lookup(prefix); ok {
 			return e.exists, nil
 		}
 	}
@@ -370,8 +487,8 @@ func (s *S3FS) dirExists(p string) (bool, error) {
 		return false, err
 	}
 	exists := len(out.Contents) > 0
-	if s.cache != nil {
-		s.cache.store(prefix, exists, nil, nil)
+	if s.mem != nil {
+		s.mem.store(prefix, exists, nil, nil)
 	}
 	return exists, nil
 }
@@ -399,7 +516,11 @@ func (s *S3FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File
 		}
 		var data []byte
 		if flag&os.O_TRUNC == 0 {
-			data = wf.snapshot()
+			var err error
+			data, err = wf.snapshot()
+			if err != nil {
+				return nil, err
+			}
 		}
 		return newWriteFile(s, cleanPath(filename), flag, perm, data, true), nil
 	}
@@ -425,17 +546,17 @@ func (s *S3FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File
 			}
 			return newReadFile(s, p, h), nil
 		}
-		var data []byte
-		if flag&os.O_TRUNC == 0 {
-			data, err = s.getAll(s.key(p))
-			if err != nil {
-				if isNotFound(err) {
-					return nil, &fs.PathError{Op: "open", Path: filename, Err: fs.ErrNotExist}
-				}
-				return nil, err
-			}
+		if flag&os.O_TRUNC != 0 {
+			return newWriteFile(s, p, flag, perm, nil, true), nil
 		}
-		return newWriteFile(s, p, flag, perm, data, flag&os.O_TRUNC != 0), nil
+		buf, err := s.bufForExisting(p, h)
+		if err != nil {
+			if isNotFound(err) {
+				return nil, &fs.PathError{Op: "open", Path: filename, Err: fs.ErrNotExist}
+			}
+			return nil, err
+		}
+		return newWriteFileBuf(s, p, flag, perm, buf, false), nil
 	}
 
 	if ok, err := s.dirExists(p); err != nil {

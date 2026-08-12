@@ -177,7 +177,66 @@ func (f *readFile) Lock() error { return nil }
 // Unlock implements billy.Locker as a no-op.
 func (f *readFile) Unlock() error { return nil }
 
-// writeFile buffers contents in memory and uploads to S3 on Close or Sync.
+// writeBuf is the backing store of a writeFile: in memory, or spilled to a
+// local file when the disk cache is enabled and contents grow large.
+type writeBuf interface {
+	len() int64
+	// readAt reports io.EOF at or past the end and on short reads.
+	readAt(p []byte, off int64) (int, error)
+	// writeAt grows the buffer with zeros when writing past the end.
+	writeAt(p []byte, off int64) (int, error)
+	truncate(size int64) error
+	// bytes exposes the raw buffer when memory-backed.
+	bytes() ([]byte, bool)
+	// snapshot returns an independent copy of the contents.
+	snapshot() ([]byte, error)
+	// destroy releases resources once no handle can read the buffer again.
+	destroy()
+}
+
+type memBuf struct{ data []byte }
+
+func (b *memBuf) len() int64 { return int64(len(b.data)) }
+
+func (b *memBuf) readAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(b.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (b *memBuf) writeAt(p []byte, off int64) (int, error) {
+	if end := off + int64(len(p)); end > int64(len(b.data)) {
+		grown := make([]byte, end)
+		copy(grown, b.data)
+		b.data = grown
+	}
+	return copy(b.data[off:], p), nil
+}
+
+func (b *memBuf) truncate(size int64) error {
+	if size <= int64(len(b.data)) {
+		b.data = b.data[:size]
+	} else {
+		grown := make([]byte, size)
+		copy(grown, b.data)
+		b.data = grown
+	}
+	return nil
+}
+
+func (b *memBuf) bytes() ([]byte, bool) { return b.data, true }
+
+func (b *memBuf) snapshot() ([]byte, error) { return append([]byte(nil), b.data...), nil }
+
+func (b *memBuf) destroy() {}
+
+// writeFile buffers contents in memory (or a local spill file, see
+// writeBuf) and uploads to S3 on Close or Sync.
 type writeFile struct {
 	fs   *S3FS
 	name string
@@ -185,14 +244,19 @@ type writeFile struct {
 	perm fs.FileMode
 
 	mu      sync.Mutex
-	data    []byte
+	buf     writeBuf
 	pos     int64
 	dirty   bool
 	closed  bool
+	shared  int // open sharedReadFile handles
 	modTime time.Time
 }
 
 func newWriteFile(s *S3FS, p string, flag int, perm fs.FileMode, data []byte, dirty bool) *writeFile {
+	return newWriteFileBuf(s, p, flag, perm, &memBuf{data: data}, dirty)
+}
+
+func newWriteFileBuf(s *S3FS, p string, flag int, perm fs.FileMode, buf writeBuf, dirty bool) *writeFile {
 	if perm == 0 {
 		perm = defaultFileMode
 	}
@@ -201,19 +265,44 @@ func newWriteFile(s *S3FS, p string, flag int, perm fs.FileMode, data []byte, di
 		name:    p,
 		flag:    flag,
 		perm:    perm.Perm(),
-		data:    data,
+		buf:     buf,
 		dirty:   dirty,
 		modTime: time.Now(),
 	}
+	f.maybeSpillLocked(buf.len())
 	s.trackWrite(f)
 	return f
 }
 
+// maybeSpillLocked migrates an in-memory buffer to a spill file once it
+// outgrows the threshold; failures keep the buffer in memory. Caller must
+// hold f.mu (or hold the only reference).
+func (f *writeFile) maybeSpillLocked(newEnd int64) {
+	if f.fs.disk == nil || newEnd <= f.fs.spillThreshold() {
+		return
+	}
+	mb, ok := f.buf.(*memBuf)
+	if !ok {
+		return
+	}
+	fb, err := f.fs.disk.newSpill()
+	if err != nil {
+		return
+	}
+	if len(mb.data) > 0 {
+		if _, err := fb.writeAt(mb.data, 0); err != nil {
+			fb.destroy()
+			return
+		}
+	}
+	f.buf = fb
+}
+
 // snapshot returns a copy of the current buffer.
-func (f *writeFile) snapshot() []byte {
+func (f *writeFile) snapshot() ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]byte(nil), f.data...)
+	return f.buf.snapshot()
 }
 
 func (f *writeFile) Name() string { return f.name }
@@ -227,7 +316,7 @@ func (f *writeFile) Stat() (fs.FileInfo, error) {
 	defer f.mu.Unlock()
 	return &fileInfo{
 		name:    path.Base(f.name),
-		size:    int64(len(f.data)),
+		size:    f.buf.len(),
 		mode:    f.perm,
 		modTime: f.modTime,
 	}, nil
@@ -242,12 +331,15 @@ func (f *writeFile) Read(p []byte) (int, error) {
 	if !f.readable() {
 		return 0, &fs.PathError{Op: "read", Path: f.name, Err: fs.ErrPermission}
 	}
-	if f.pos >= int64(len(f.data)) {
+	if f.pos >= f.buf.len() {
 		return 0, io.EOF
 	}
-	n := copy(p, f.data[f.pos:])
+	n, err := f.buf.readAt(p, f.pos)
 	f.pos += int64(n)
-	return n, nil
+	if err == io.EOF && n > 0 {
+		err = nil
+	}
+	return n, err
 }
 
 func (f *writeFile) ReadAt(p []byte, off int64) (int, error) {
@@ -262,14 +354,10 @@ func (f *writeFile) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, &fs.PathError{Op: "readat", Path: f.name, Err: fs.ErrInvalid}
 	}
-	if off >= int64(len(f.data)) {
+	if off >= f.buf.len() {
 		return 0, io.EOF
 	}
-	n := copy(p, f.data[off:])
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
+	return f.buf.readAt(p, off)
 }
 
 func (f *writeFile) Write(p []byte) (int, error) {
@@ -279,11 +367,11 @@ func (f *writeFile) Write(p []byte) (int, error) {
 		return 0, &fs.PathError{Op: "write", Path: f.name, Err: fs.ErrClosed}
 	}
 	if f.flag&os.O_APPEND != 0 {
-		f.pos = int64(len(f.data))
+		f.pos = f.buf.len()
 	}
-	n := f.writeAt(p, f.pos)
+	n, err := f.writeAt(p, f.pos)
 	f.pos += int64(n)
-	return n, nil
+	return n, err
 }
 
 func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
@@ -295,21 +383,20 @@ func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, &fs.PathError{Op: "writeat", Path: f.name, Err: fs.ErrInvalid}
 	}
-	return f.writeAt(p, off), nil
+	return f.writeAt(p, off)
 }
 
 // writeAt writes p at off, growing the buffer with zeros when needed.
 // Caller must hold f.mu.
-func (f *writeFile) writeAt(p []byte, off int64) int {
-	if end := off + int64(len(p)); end > int64(len(f.data)) {
-		grown := make([]byte, end)
-		copy(grown, f.data)
-		f.data = grown
+func (f *writeFile) writeAt(p []byte, off int64) (int, error) {
+	f.maybeSpillLocked(off + int64(len(p)))
+	n, err := f.buf.writeAt(p, off)
+	if err != nil {
+		return n, &fs.PathError{Op: "write", Path: f.name, Err: err}
 	}
-	n := copy(f.data[off:], p)
 	f.dirty = true
 	f.modTime = time.Now()
-	return n
+	return n, nil
 }
 
 func (f *writeFile) Seek(offset int64, whence int) (int64, error) {
@@ -325,7 +412,7 @@ func (f *writeFile) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		abs = f.pos + offset
 	case io.SeekEnd:
-		abs = int64(len(f.data)) + offset
+		abs = f.buf.len() + offset
 	default:
 		return 0, &fs.PathError{Op: "seek", Path: f.name, Err: fs.ErrInvalid}
 	}
@@ -345,12 +432,9 @@ func (f *writeFile) Truncate(size int64) error {
 	if size < 0 {
 		return &fs.PathError{Op: "truncate", Path: f.name, Err: fs.ErrInvalid}
 	}
-	if size <= int64(len(f.data)) {
-		f.data = f.data[:size]
-	} else {
-		grown := make([]byte, size)
-		copy(grown, f.data)
-		f.data = grown
+	f.maybeSpillLocked(size)
+	if err := f.buf.truncate(size); err != nil {
+		return &fs.PathError{Op: "truncate", Path: f.name, Err: err}
 	}
 	f.dirty = true
 	f.modTime = time.Now()
@@ -363,7 +447,13 @@ func (f *writeFile) flush() error {
 		return nil
 	}
 	meta := map[string]string{modeMetaKey: fmt.Sprintf("%o", f.perm)}
-	if err := f.fs.put(f.fs.key(f.name), f.data, meta); err != nil {
+	var err error
+	if data, ok := f.buf.bytes(); ok {
+		err = f.fs.put(f.fs.key(f.name), data, meta)
+	} else {
+		err = f.fs.putSpill(f.fs.key(f.name), f.buf.(*fileBuf), meta)
+	}
+	if err != nil {
 		return err
 	}
 	f.dirty = false
@@ -390,9 +480,20 @@ func (f *writeFile) Close() error {
 		return err
 	}
 	f.closed = true
-	// keep f.data: shared readers opened on this path may still be active
+	// the buffer stays alive while shared readers opened on this path are
+	// still active; maybeDestroyLocked releases it once the last one closes
 	f.fs.untrackWrite(f)
+	f.maybeDestroyLocked()
 	return nil
+}
+
+// maybeDestroyLocked releases the buffer once the writer is closed and no
+// shared read handles remain. Caller must hold f.mu.
+func (f *writeFile) maybeDestroyLocked() {
+	if f.closed && f.shared == 0 {
+		f.buf.destroy()
+		f.buf = &memBuf{}
+	}
 }
 
 // Lock implements billy.Locker as a no-op.
@@ -418,6 +519,9 @@ var (
 )
 
 func newSharedReadFile(wf *writeFile) *sharedReadFile {
+	wf.mu.Lock()
+	wf.shared++
+	wf.mu.Unlock()
 	return &sharedReadFile{wf: wf}
 }
 
@@ -461,7 +565,7 @@ func (f *sharedReadFile) Seek(offset int64, whence int) (int64, error) {
 		abs = f.pos + offset
 	case io.SeekEnd:
 		f.wf.mu.Lock()
-		abs = int64(len(f.wf.data)) + offset
+		abs = f.wf.buf.len() + offset
 		f.wf.mu.Unlock()
 	default:
 		return 0, &fs.PathError{Op: "seek", Path: f.wf.name, Err: fs.ErrInvalid}
@@ -492,6 +596,10 @@ func (f *sharedReadFile) Close() error {
 		return &fs.PathError{Op: "close", Path: f.wf.name, Err: fs.ErrClosed}
 	}
 	f.closed = true
+	f.wf.mu.Lock()
+	f.wf.shared--
+	f.wf.maybeDestroyLocked()
+	f.wf.mu.Unlock()
 	return nil
 }
 
@@ -506,12 +614,8 @@ func (f *sharedReadFile) Unlock() error { return nil }
 func (f *writeFile) readAtShared(p []byte, off int64) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if off >= int64(len(f.data)) {
+	if off >= f.buf.len() {
 		return 0, io.EOF
 	}
-	n := copy(p, f.data[off:])
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
+	return f.buf.readAt(p, off)
 }
