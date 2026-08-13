@@ -1,6 +1,7 @@
 package s3fs
 
 import (
+	"sync"
 	"time"
 
 	"github.com/golang/groupcache/lru"
@@ -28,6 +29,9 @@ type lruIndex[V any] struct {
 
 	cache *lru.Cache
 	used  int64
+	// entryPool recycles lruEntry shells between put and eviction; the
+	// cached values themselves are never pooled.
+	entryPool sync.Pool
 }
 
 func newLRUIndex[V any](maxBytes int64, ttl time.Duration, onEvict func(V)) *lruIndex[V] {
@@ -45,6 +49,9 @@ func newLRUIndex[V any](maxBytes int64, ttl time.Duration, onEvict func(V)) *lru
 			if x.onEvict != nil {
 				x.onEvict(e.val)
 			}
+			var zero V
+			e.val = zero // do not retain the evicted value through the pool
+			x.entryPool.Put(e)
 		},
 	}
 	return x
@@ -79,7 +86,12 @@ func (x *lruIndex[V]) put(key string, v V, cost int64) {
 		}
 		return
 	}
-	e := &lruEntry[V]{val: v, cost: cost}
+	e, _ := x.entryPool.Get().(*lruEntry[V])
+	if e == nil {
+		e = new(lruEntry[V])
+	}
+	e.val, e.cost = v, cost
+	e.expires = time.Time{}
 	if x.ttl > 0 {
 		e.expires = time.Now().Add(x.ttl)
 	}

@@ -37,6 +37,16 @@ type writeBuf interface {
 
 type memBuf struct{ data []byte }
 
+// newMemBuf wraps data, drawing recycled capacity from the pool when the
+// buffer starts empty. Non-nil data must be exclusively owned by the buffer:
+// its backing array is recycled once grown, spilled or destroyed.
+func newMemBuf(data []byte) *memBuf {
+	if data == nil {
+		return &memBuf{data: pooledData()}
+	}
+	return &memBuf{data: data}
+}
+
 func (b *memBuf) len() int64 { return int64(len(b.data)) }
 
 func (b *memBuf) readAt(p []byte, off int64) (int, error) {
@@ -73,6 +83,7 @@ func (b *memBuf) grow(end int64) {
 	}
 	grown := make([]byte, end, newCap)
 	copy(grown, b.data)
+	recycleData(b.data)
 	b.data = grown
 }
 
@@ -89,7 +100,10 @@ func (b *memBuf) bytes() ([]byte, bool) { return b.data, true }
 
 func (b *memBuf) snapshot() ([]byte, error) { return append([]byte(nil), b.data...), nil }
 
-func (b *memBuf) destroy() {}
+func (b *memBuf) destroy() {
+	recycleData(b.data)
+	b.data = nil
+}
 
 // writeFile buffers contents in memory (or a local spill file, see
 // writeBuf) and uploads to S3 on Close or Sync.
@@ -112,7 +126,7 @@ type writeFile struct {
 }
 
 func newWriteFile(s *S3FS, p string, flag int, perm fs.FileMode, data []byte, dirty bool) *writeFile {
-	return newWriteFileBuf(s, p, flag, perm, &memBuf{data: data}, dirty)
+	return newWriteFileBuf(s, p, flag, perm, newMemBuf(data), dirty)
 }
 
 func newWriteFileBuf(s *S3FS, p string, flag int, perm fs.FileMode, buf writeBuf, dirty bool) *writeFile {
@@ -154,6 +168,7 @@ func (f *writeFile) maybeSpillLocked(newEnd int64) {
 			return
 		}
 	}
+	recycleData(mb.data)
 	f.buf = fb
 }
 
