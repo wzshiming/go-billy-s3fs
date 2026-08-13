@@ -3,7 +3,9 @@ package s3fs_test
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -201,4 +203,55 @@ func TestCacheBigObjectStreams(t *testing.T) {
 	if client.count("GetObject") == before {
 		t.Fatal("big object should stream from S3, no GetObject calls seen")
 	}
+}
+
+// TestOpenSingleGetObject verifies that on a cold cache an existing file is
+// opened with a single GetObject and no HeadObject, for both read-only and
+// read-modify-write opens, including through symlinks.
+func TestOpenSingleGetObject(t *testing.T) {
+	client := newCountingClient(newTestClient(t))
+	bfs := s3fs.New(client, testBucket)
+
+	writeFull(t, bfs, "dir/a.txt", "hello")
+	if err := bfs.Symlink("a.txt", "dir/link"); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("read-only", func(t *testing.T) {
+		heads, gets := client.count("HeadObject"), client.count("GetObject")
+		if got := readFull(t, bfs, "dir/a.txt"); got != "hello" {
+			t.Fatalf("content = %q", got)
+		}
+		if h, g := client.count("HeadObject")-heads, client.count("GetObject")-gets; h != 0 || g != 1 {
+			t.Fatalf("open+read = %d HeadObject + %d GetObject, want 0 + 1", h, g)
+		}
+	})
+
+	t.Run("read-write", func(t *testing.T) {
+		heads, gets := client.count("HeadObject"), client.count("GetObject")
+		f, err := bfs.OpenFile("dir/a.txt", os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(f)
+		if err != nil || string(data) != "hello" {
+			t.Fatalf("read = %q, %v", data, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if h, g := client.count("HeadObject")-heads, client.count("GetObject")-gets; h != 0 || g != 1 {
+			t.Fatalf("open+read = %d HeadObject + %d GetObject, want 0 + 1", h, g)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		heads, gets := client.count("HeadObject"), client.count("GetObject")
+		if got := readFull(t, bfs, "dir/link"); got != "hello" {
+			t.Fatalf("content = %q", got)
+		}
+		if h, g := client.count("HeadObject")-heads, client.count("GetObject")-gets; h != 0 || g != 2 {
+			t.Fatalf("open+read via symlink = %d HeadObject + %d GetObject, want 0 + 2", h, g)
+		}
+	})
 }

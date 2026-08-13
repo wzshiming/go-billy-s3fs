@@ -101,6 +101,15 @@ func (c *diskCache) open(key, etag string) (*os.File, bool) {
 	return f, true
 }
 
+// has reports whether the cache holds a not-yet-expired body for key; the
+// ETag is not validated.
+func (c *diskCache) has(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.idx.get(key)
+	return ok
+}
+
 // insert registers path as the cached body of key, replacing any previous
 // entry and evicting least-recently-used files over budget. The cache owns
 // the file afterwards.

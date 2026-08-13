@@ -42,13 +42,15 @@ var (
 	_ billy.Locker = (*readOnlyFile)(nil)
 )
 
-// newReadFile returns a file streaming the object at p from S3.
-func newReadFile(s *S3FS, p string, h *s3.HeadObjectOutput) *readOnlyFile {
+// newReadFile returns a file streaming the object at p from S3. body, when
+// non-nil, is an already-open stream at offset 0 that serves the first
+// sequential reads.
+func newReadFile(s *S3FS, p string, h *s3.HeadObjectOutput, body io.ReadCloser) *readOnlyFile {
 	info := infoFromHeadValue(path.Base(p), h)
 	return &readOnlyFile{
 		name: p,
 		info: info,
-		back: &s3Backend{fs: s, key: s.key(p), size: info.size},
+		back: &s3Backend{fs: s, key: s.key(p), size: info.size, body: body},
 	}
 }
 
