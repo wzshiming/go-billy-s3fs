@@ -139,7 +139,7 @@ func (s *S3FS) bufForExisting(p string, h *s3.HeadObjectOutput) (writeBuf, error
 		if err != nil {
 			return nil, err
 		}
-		return &memBuf{data: data}, nil
+		return newMemBuf(data), nil
 	}
 	fb, err := s.disk.newSpill()
 	if err != nil {
@@ -147,7 +147,7 @@ func (s *S3FS) bufForExisting(p string, h *s3.HeadObjectOutput) (writeBuf, error
 		if gerr != nil {
 			return nil, gerr
 		}
-		return &memBuf{data: data}, nil
+		return newMemBuf(data), nil
 	}
 	out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
@@ -158,7 +158,7 @@ func (s *S3FS) bufForExisting(p string, h *s3.HeadObjectOutput) (writeBuf, error
 		return nil, err
 	}
 	defer out.Body.Close()
-	n, err := io.Copy(fb.f, out.Body)
+	n, err := copyStream(fb.f, out.Body)
 	if err != nil {
 		fb.destroy()
 		return nil, err
@@ -176,7 +176,7 @@ func (s *S3FS) bufFromGet(h *s3.HeadObjectOutput, g *s3.GetObjectOutput) (writeB
 		if err != nil {
 			return nil, err
 		}
-		return &memBuf{data: data}, nil
+		return newMemBuf(data), nil
 	}
 	fb, err := s.disk.newSpill()
 	if err != nil {
@@ -184,9 +184,9 @@ func (s *S3FS) bufFromGet(h *s3.HeadObjectOutput, g *s3.GetObjectOutput) (writeB
 		if rerr != nil {
 			return nil, rerr
 		}
-		return &memBuf{data: data}, nil
+		return newMemBuf(data), nil
 	}
-	n, err := io.Copy(fb.f, g.Body)
+	n, err := copyStream(fb.f, g.Body)
 	if err != nil {
 		fb.destroy()
 		return nil, err
@@ -486,7 +486,7 @@ func (s *S3FS) diskFill(key, etag string, h *s3.HeadObjectOutput, p string, body
 	if err != nil {
 		return nil, false, nil // disk unusable; stream instead
 	}
-	size, err := io.Copy(f, body)
+	size, err := copyStream(f, body)
 	if err != nil {
 		f.Close()
 		os.Remove(tmp)
