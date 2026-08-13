@@ -51,21 +51,36 @@ func (b *memBuf) readAt(p []byte, off int64) (int, error) {
 }
 
 func (b *memBuf) writeAt(p []byte, off int64) (int, error) {
-	if end := off + int64(len(p)); end > int64(len(b.data)) {
-		grown := make([]byte, end)
-		copy(grown, b.data)
-		b.data = grown
-	}
+	b.grow(off + int64(len(p)))
 	return copy(b.data[off:], p), nil
+}
+
+// grow extends the buffer to end with zeros. Capacity doubles so chunked
+// appends stay O(n) overall instead of reallocating per write.
+func (b *memBuf) grow(end int64) {
+	if end <= int64(len(b.data)) {
+		return
+	}
+	if end <= int64(cap(b.data)) {
+		// reused capacity may hold stale bytes from an earlier truncate
+		clear(b.data[len(b.data):end])
+		b.data = b.data[:end]
+		return
+	}
+	newCap := 2 * cap(b.data)
+	if newCap < int(end) {
+		newCap = int(end)
+	}
+	grown := make([]byte, end, newCap)
+	copy(grown, b.data)
+	b.data = grown
 }
 
 func (b *memBuf) truncate(size int64) error {
 	if size <= int64(len(b.data)) {
 		b.data = b.data[:size]
 	} else {
-		grown := make([]byte, size)
-		copy(grown, b.data)
-		b.data = grown
+		b.grow(size)
 	}
 	return nil
 }
