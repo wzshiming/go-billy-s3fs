@@ -20,7 +20,8 @@ func newLockerPair(t *testing.T, ttl, poll time.Duration) (*s3.Client, *s3fs.S3F
 	t.Helper()
 	client := newTestClient(t)
 	mk := func() *s3fs.S3FS {
-		return s3fs.New(client, testBucket,
+		return s3fs.New(testBucket,
+			s3fs.WithClient(client),
 			s3fs.WithPrefix("repo"),
 			s3fs.WithLocker(s3fs.NewS3Locker(client, testBucket,
 				s3fs.WithLockTTL(ttl), s3fs.WithLockPoll(poll))))
@@ -169,7 +170,7 @@ func TestS3LockerCtxCancel(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	fsB := s3fs.New(client, testBucket, s3fs.WithContext(ctx),
+	fsB := s3fs.New(testBucket, s3fs.WithClient(client), s3fs.WithContext(ctx),
 		s3fs.WithLocker(s3fs.NewS3Locker(client, testBucket,
 			s3fs.WithLockTTL(10*time.Second), s3fs.WithLockPoll(20*time.Millisecond))))
 	writeFull(t, fsB, "/a.txt", "content")

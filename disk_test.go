@@ -38,7 +38,7 @@ func dirFiles(t *testing.T, dir, prefix string) []string {
 func TestDiskCacheServesSecondOpenLocally(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
 	dir := t.TempDir()
-	bfs := s3fs.New(client, testBucket, s3fs.WithDiskCache(dir, 1<<20, 0))
+	bfs := s3fs.New(testBucket, s3fs.WithClient(client), s3fs.WithDiskCache(dir, 1<<20, 0))
 	content := strings.Repeat("packfile-bytes.", 300) // ~4.5KB
 
 	writeFull(t, bfs, "objects/pack/pack-1.pack", content)
@@ -80,7 +80,7 @@ func TestDiskCacheServesSecondOpenLocally(t *testing.T) {
 func TestDiskSpillWriteAdoptedIntoCache(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
 	dir := t.TempDir()
-	bfs := s3fs.New(client, testBucket, tinyMemOpts(dir)...)
+	bfs := s3fs.New(testBucket, append(tinyMemOpts(dir), s3fs.WithClient(client))...)
 	content := bytes.Repeat([]byte("spill-me!"), 1000) // 9KB > 1KB threshold
 
 	f, err := bfs.Create("big.bin")
@@ -123,7 +123,7 @@ func TestDiskSpillWriteAdoptedIntoCache(t *testing.T) {
 func TestDiskSpillNotAdoptedOnSync(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
 	dir := t.TempDir()
-	bfs := s3fs.New(client, testBucket, tinyMemOpts(dir)...)
+	bfs := s3fs.New(testBucket, append(tinyMemOpts(dir), s3fs.WithClient(client))...)
 	part := bytes.Repeat([]byte("sync-me!!"), 1000) // 9KB > 1KB threshold
 
 	f, err := bfs.Create("big.bin")
@@ -166,7 +166,7 @@ func TestDiskSpillNotAdoptedOnSync(t *testing.T) {
 func TestDiskCacheSurvivesRename(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
 	dir := t.TempDir()
-	bfs := s3fs.New(client, testBucket, tinyMemOpts(dir)...)
+	bfs := s3fs.New(testBucket, append(tinyMemOpts(dir), s3fs.WithClient(client))...)
 	content := bytes.Repeat([]byte("rename-me"), 1000)
 
 	if err := writeBytes(bfs, "tmp_pack", content); err != nil {
@@ -218,7 +218,7 @@ func TestDiskCacheEviction(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
 	dir := t.TempDir()
 	// budget fits one ~4KB body (+overhead) but not two
-	bfs := s3fs.New(client, testBucket, s3fs.WithDiskCache(dir, 6<<10, 0))
+	bfs := s3fs.New(testBucket, s3fs.WithClient(client), s3fs.WithDiskCache(dir, 6<<10, 0))
 	blob := strings.Repeat("x", 4<<10)
 
 	writeFull(t, bfs, "a.bin", blob)

@@ -23,9 +23,11 @@ var benchVariants = []struct {
 }{
 	{"memfs", func(b *testing.B) billy.Filesystem { return memfs.New() }},
 	{"osfs", func(b *testing.B) billy.Filesystem { return osfs.New(b.TempDir()) }},
-	{"s3fs", func(b *testing.B) billy.Filesystem { return s3fs.New(newTestClient(b), testBucket) }},
+	{"s3fs", func(b *testing.B) billy.Filesystem {
+		return s3fs.New(testBucket, s3fs.WithClient(newTestClient(b)))
+	}},
 	{"s3fs-cached", func(b *testing.B) billy.Filesystem {
-		return s3fs.New(newTestClient(b), testBucket, s3fs.WithMemCache(64<<20, 0))
+		return s3fs.New(testBucket, s3fs.WithClient(newTestClient(b)), s3fs.WithMemCache(64<<20, 0))
 	}},
 	{"s3fs-disk", func(b *testing.B) billy.Filesystem {
 		return newTestFS(b, s3fs.WithDiskCache(b.TempDir(), 256<<20, 0))

@@ -28,11 +28,17 @@
 // are process-local by default; WithLocker adds a cross-process backend
 // such as S3Locker, which leases lock objects via S3 conditional writes.
 //
+// PresignGet and PresignPut (enabled via WithPresignClient) return
+// presigned HTTP requests for a file's contents, letting clients download
+// or upload the bytes directly from/to S3 instead of proxying them through
+// this process.
+//
 // Code layout: this file defines the filesystem type and its
 // billy.Filesystem methods; s3ops.go holds the S3 request primitives and
 // cache orchestration; file_read.go and file_write.go implement the file
-// handles; lock.go and lock_s3.go implement file locking; mem.go, disk.go
-// and lru.go implement the cache tiers.
+// handles; presign.go implements presigned URLs (PresignGet, PresignPut);
+// lock.go and lock_s3.go implement file locking; mem.go, disk.go and
+// lru.go implement the cache tiers.
 package s3fs
 
 import (
@@ -73,8 +79,8 @@ var (
 	ErrTooManySymlinks = errors.New("too many levels of symbolic links")
 )
 
-// API is the subset of the S3 client used by S3FS. *s3.Client satisfies it.
-type API interface {
+// Client is the subset of the S3 client used by S3FS. *s3.Client satisfies it.
+type Client interface {
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
@@ -85,7 +91,7 @@ type API interface {
 
 // S3FS is a billy.Filesystem backed by an S3 bucket.
 type S3FS struct {
-	client API
+	client Client
 	bucket string
 	prefix string
 	ctx    context.Context
@@ -111,6 +117,10 @@ type S3FS struct {
 	// locks implements flock-like advisory file locking, optionally backed
 	// by a cross-process Locker.
 	locks *lockManager
+
+	// presignClient, when non-nil, generates the presigned requests returned by
+	// PresignGet and PresignPut.
+	presignClient PresignClient
 }
 
 var (
@@ -120,6 +130,19 @@ var (
 
 // Option configures an S3FS.
 type Option func(*S3FS)
+
+// WithClient sets the S3 client backing the filesystem (e.g. *s3.Client).
+// It is required.
+func WithClient(client Client) Option {
+	return func(s *S3FS) { s.client = client }
+}
+
+// WithPresignClient enables PresignGet and PresignPut, typically with
+// s3.NewPresignClient(client). Without it they fail with
+// ErrNoPresignClient.
+func WithPresignClient(p PresignClient) Option {
+	return func(s *S3FS) { s.presignClient = p }
+}
 
 // WithPrefix roots the filesystem at the given key prefix inside the bucket.
 func WithPrefix(prefix string) Option {
@@ -171,10 +194,10 @@ func WithDiskCache(dir string, maxBytes int64, ttl time.Duration) Option {
 	}
 }
 
-// New returns a billy filesystem stored in the given bucket.
-func New(client API, bucket string, opts ...Option) *S3FS {
+// New returns a billy filesystem stored in the given bucket, configured by
+// the options; WithClient is required.
+func New(bucket string, opts ...Option) *S3FS {
 	s := &S3FS{
-		client:     client,
 		bucket:     bucket,
 		ctx:        context.Background(),
 		openWrites: make(map[string]*writeFile),
@@ -182,6 +205,9 @@ func New(client API, bucket string, opts ...Option) *S3FS {
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.client == nil {
+		panic("s3fs: WithClient is required")
 	}
 	return s
 }

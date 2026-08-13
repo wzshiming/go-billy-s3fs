@@ -25,8 +25,8 @@ import (
 
 const testBucket = "test-bucket"
 
-// newTestClient starts an in-memory fake S3 server and returns a client for it.
-func newTestClient(t testing.TB) *s3.Client {
+// newTestServer starts an in-memory fake S3 server and returns its URL.
+func newTestServer(t testing.TB) string {
 	t.Helper()
 	backend := s3mem.New()
 	if err := backend.CreateBucket(testBucket); err != nil {
@@ -34,10 +34,15 @@ func newTestClient(t testing.TB) *s3.Client {
 	}
 	server := httptest.NewServer(gofakes3.New(backend).Server())
 	t.Cleanup(server.Close)
+	return server.URL
+}
 
+// newTestClient returns a client for a fresh in-memory fake S3 server.
+func newTestClient(t testing.TB) *s3.Client {
+	t.Helper()
 	return s3.New(s3.Options{
 		Region:                     "us-east-1",
-		BaseEndpoint:               aws.String(server.URL),
+		BaseEndpoint:               aws.String(newTestServer(t)),
 		UsePathStyle:               true,
 		Credentials:                credentials.NewStaticCredentialsProvider("test", "test", ""),
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
@@ -47,7 +52,11 @@ func newTestClient(t testing.TB) *s3.Client {
 
 func newTestFS(t testing.TB, opts ...s3fs.Option) *s3fs.S3FS {
 	t.Helper()
-	return s3fs.New(newTestClient(t), testBucket, opts...)
+	client := newTestClient(t)
+	return s3fs.New(testBucket, append([]s3fs.Option{
+		s3fs.WithClient(client),
+		s3fs.WithPresignClient(s3.NewPresignClient(client)),
+	}, opts...)...)
 }
 
 // fsVariants are the option sets shared suites run against: the plain
@@ -547,9 +556,9 @@ func TestChroot(t *testing.T) {
 
 func TestWithPrefix(t *testing.T) {
 	client := newTestClient(t)
-	fsA := s3fs.New(client, testBucket, s3fs.WithPrefix("tenant-a"))
-	fsB := s3fs.New(client, testBucket, s3fs.WithPrefix("tenant-b"))
-	root := s3fs.New(client, testBucket)
+	fsA := s3fs.New(testBucket, s3fs.WithClient(client), s3fs.WithPrefix("tenant-a"))
+	fsB := s3fs.New(testBucket, s3fs.WithClient(client), s3fs.WithPrefix("tenant-b"))
+	root := s3fs.New(testBucket, s3fs.WithClient(client))
 
 	writeFull(t, fsA, "cfg", "A")
 	writeFull(t, fsB, "cfg", "B")
@@ -714,12 +723,12 @@ func TestSharedReadHandleClosed(t *testing.T) {
 // truncListClient rewrites ListObjectsV2 responses to emulate S3-compatible
 // servers that return fewer keys than MaxKeys with IsTruncated set.
 type truncListClient struct {
-	s3fs.API
+	s3fs.Client
 	rewrite func(in *s3.ListObjectsV2Input, out *s3.ListObjectsV2Output)
 }
 
 func (c *truncListClient) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
-	out, err := c.API.ListObjectsV2(ctx, in, opts...)
+	out, err := c.Client.ListObjectsV2(ctx, in, opts...)
 	if err == nil {
 		c.rewrite(in, out)
 	}
@@ -730,13 +739,13 @@ func (c *truncListClient) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV
 // when the emptiness-check page is truncated, instead of dropping the
 // marker of a non-empty directory.
 func TestRemoveDirTruncatedPage(t *testing.T) {
-	client := &truncListClient{API: newTestClient(t), rewrite: func(in *s3.ListObjectsV2Input, out *s3.ListObjectsV2Output) {
+	client := &truncListClient{Client: newTestClient(t), rewrite: func(in *s3.ListObjectsV2Input, out *s3.ListObjectsV2Output) {
 		if aws.ToInt32(in.MaxKeys) == 2 && len(out.Contents) > 1 {
 			out.Contents = out.Contents[:1]
 			out.IsTruncated = aws.Bool(true)
 		}
 	}}
-	bfs := s3fs.New(client, testBucket)
+	bfs := s3fs.New(testBucket, s3fs.WithClient(client))
 	if err := bfs.MkdirAll("d", 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -756,13 +765,13 @@ func TestRemoveDirTruncatedPage(t *testing.T) {
 // TestDirExistsTruncatedEmptyPage verifies an empty listing page with
 // IsTruncated set still counts as proof that the directory exists.
 func TestDirExistsTruncatedEmptyPage(t *testing.T) {
-	client := &truncListClient{API: newTestClient(t), rewrite: func(in *s3.ListObjectsV2Input, out *s3.ListObjectsV2Output) {
+	client := &truncListClient{Client: newTestClient(t), rewrite: func(in *s3.ListObjectsV2Input, out *s3.ListObjectsV2Output) {
 		if aws.ToInt32(in.MaxKeys) == 1 && len(out.Contents) > 0 {
 			out.Contents = nil
 			out.IsTruncated = aws.Bool(true)
 		}
 	}}
-	bfs := s3fs.New(client, testBucket)
+	bfs := s3fs.New(testBucket, s3fs.WithClient(client))
 	writeFull(t, bfs, "d/child", "x")
 
 	fi, err := bfs.Stat("d")

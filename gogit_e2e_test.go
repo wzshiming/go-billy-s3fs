@@ -31,7 +31,7 @@ func testGoGitPushCloneE2E(t *testing.T, opts []s3fs.Option) {
 	s3Client := newTestClient(t)
 
 	// bare remote repository living in S3
-	remoteFS := s3fs.New(s3Client, testBucket, append([]s3fs.Option{s3fs.WithPrefix("remote.git")}, opts...)...)
+	remoteFS := s3fs.New(testBucket, append([]s3fs.Option{s3fs.WithClient(s3Client), s3fs.WithPrefix("remote.git")}, opts...)...)
 	remoteStore := filesystem.NewStorage(remoteFS, cache.NewObjectLRUDefault())
 	if _, err := git.Init(remoteStore); err != nil {
 		t.Fatalf("init remote: %v", err)
@@ -182,7 +182,7 @@ func TestGoGitCloneIntoS3E2E(t *testing.T) {
 
 	// destination storage in S3
 	s3Client := newTestClient(t)
-	dstFS := s3fs.New(s3Client, testBucket, s3fs.WithPrefix("mirror.git"))
+	dstFS := s3fs.New(testBucket, s3fs.WithClient(s3Client), s3fs.WithPrefix("mirror.git"))
 	dstStore := filesystem.NewStorage(dstFS, cache.NewObjectLRUDefault())
 	repo, err := git.Clone(dstStore, memfs.New(), &git.CloneOptions{
 		URL:           "file:///src.git",
@@ -196,7 +196,7 @@ func TestGoGitCloneIntoS3E2E(t *testing.T) {
 	}
 
 	// reopen from a fresh S3FS instance and verify the packfile is readable
-	dstFS2 := s3fs.New(s3Client, testBucket, s3fs.WithPrefix("mirror.git"))
+	dstFS2 := s3fs.New(testBucket, s3fs.WithClient(s3Client), s3fs.WithPrefix("mirror.git"))
 	dstStore2 := filesystem.NewStorage(dstFS2, cache.NewObjectLRUDefault())
 	reopened, err := git.Open(dstStore2, memfs.New())
 	if err != nil {

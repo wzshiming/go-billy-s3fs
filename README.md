@@ -19,7 +19,8 @@ By default locks only exclude handles of the same `S3FS` instance. To make them 
 
 ```go
 client := s3.NewFromConfig(cfg)
-fs := s3fs.New(client, "bucket",
+fs := s3fs.New("bucket",
+	s3fs.WithClient(client),
 	s3fs.WithPrefix("repo"),
 	s3fs.WithLocker(s3fs.NewS3Locker(client, "bucket")),
 )
@@ -30,3 +31,19 @@ fs := s3fs.New(client, "bucket",
 Caveats: the store must support conditional writes (AWS S3, MinIO and gofakes3 do), client clocks must agree well within the TTL, and like every lease-based lock it is advisory — a holder that cannot renew (e.g. a network outage longer than the TTL) silently loses the lock.
 
 Any other coordination service can be plugged in by implementing the two-method `Locker` interface (e.g. Redis with SET NX PX): S3FS serializes lock holders per path within the process, so an implementation only arbitrates between processes and needs no reentrancy.
+
+## Presigned URLs
+
+`PresignGet` and `PresignPut` return presigned requests — a method plus a self-contained URL, no extra headers required — so a server can redirect clients to exchange the bytes directly with S3 instead of proxying them:
+
+```go
+fs := s3fs.New("bucket",
+	s3fs.WithClient(client),
+	// sign against the address reachable by URL receivers when it differs
+	// from the server's own, e.g. an in-cluster endpoint vs. a public one
+	s3fs.WithPresignClient(s3.NewPresignClient(client, s3fs.WithPresignEndpoint("https://s3.example.com"))),
+)
+
+req, err := fs.PresignGet("objects/pack/pack-1234.pack", 15*time.Minute) // or PresignPut for uploads
+// http.Redirect(w, r, req.URL, http.StatusTemporaryRedirect)
+```
