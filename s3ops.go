@@ -396,7 +396,7 @@ func (s *S3FS) cachedOpen(p string, h *s3.HeadObjectOutput) (billy.File, bool, e
 	key := s.key(p)
 	if s.mem != nil && size <= s.mem.maxDataBytes() {
 		if e, ok := s.mem.lookup(key); ok && e.exists && e.data != nil {
-			return newMemReadFile(p, infoFromHeadValue(path.Base(p), h), e.data), true, nil
+			return newMemReadFile(s, p, infoFromHeadValue(path.Base(p), h), e.data), true, nil
 		}
 		data, err := s.getAll(key)
 		if err != nil {
@@ -406,12 +406,12 @@ func (s *S3FS) cachedOpen(p string, h *s3.HeadObjectOutput) (billy.File, bool, e
 			return nil, false, err
 		}
 		s.mem.store(key, true, h, data)
-		return newMemReadFile(p, infoFromHeadValue(path.Base(p), h), data), true, nil
+		return newMemReadFile(s, p, infoFromHeadValue(path.Base(p), h), data), true, nil
 	}
 	if s.disk != nil && size+entryOverhead <= s.disk.maxBytes {
 		if f, ok := s.disk.open(key, aws.ToString(h.ETag)); ok {
 			info := infoFromHeadValue(path.Base(p), h)
-			return newDiskReadFile(f, p, info), true, nil
+			return newDiskReadFile(s, f, p, info), true, nil
 		}
 		return s.diskFetch(key, h, p)
 	}
@@ -432,7 +432,7 @@ func (s *S3FS) openFromGet(p string, h *s3.HeadObjectOutput, g *s3.GetObjectOutp
 			return nil, err
 		}
 		s.mem.store(key, true, h, data)
-		return newMemReadFile(p, infoFromHeadValue(path.Base(p), h), data), nil
+		return newMemReadFile(s, p, infoFromHeadValue(path.Base(p), h), data), nil
 	}
 	if s.disk != nil && size+entryOverhead <= s.disk.maxBytes {
 		f, ok, err := s.diskFill(key, aws.ToString(h.ETag), h, p, g.Body)
@@ -497,10 +497,10 @@ func (s *S3FS) diskFill(key, etag string, h *s3.HeadObjectOutput, p string, body
 	if etag == "" {
 		// cannot validate later; serve this handle but do not cache
 		os.Remove(tmp)
-		return newDiskReadFile(f, p, info), true, nil
+		return newDiskReadFile(s, f, p, info), true, nil
 	}
 	c.insert(key, etag, tmp, size)
-	return newDiskReadFile(f, p, info), true, nil
+	return newDiskReadFile(s, f, p, info), true, nil
 }
 
 func isNotFound(err error) bool {

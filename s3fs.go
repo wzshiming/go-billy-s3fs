@@ -23,10 +23,16 @@
 // instead of RAM. Entries are validated by ETag, so overwrites by other
 // clients are detected on the next (fresh) HeadObject.
 //
+// File handles implement billy.Locker with flock-like advisory semantics:
+// exclusive, blocking, reentrant per handle and released on Close. Locks
+// are process-local by default; WithLocker adds a cross-process backend
+// such as S3Locker, which leases lock objects via S3 conditional writes.
+//
 // Code layout: this file defines the filesystem type and its
 // billy.Filesystem methods; s3ops.go holds the S3 request primitives and
 // cache orchestration; file_read.go and file_write.go implement the file
-// handles; mem.go, disk.go and lru.go implement the cache tiers.
+// handles; lock.go and lock_s3.go implement file locking; mem.go, disk.go
+// and lru.go implement the cache tiers.
 package s3fs
 
 import (
@@ -101,6 +107,10 @@ type S3FS struct {
 	// disk, when non-nil, stores object bodies too large for the memory
 	// cache as local files and spills large write buffers to disk.
 	disk *diskCache
+
+	// locks implements flock-like advisory file locking, optionally backed
+	// by a cross-process Locker.
+	locks *lockManager
 }
 
 var (
@@ -137,6 +147,14 @@ func WithMemCache(maxBytes int64, ttl time.Duration) Option {
 	}
 }
 
+// WithLocker backs file locks with a cross-process lock backend such as
+// S3Locker. Without it, Lock and Unlock still provide flock-like exclusion
+// between handles of this process, but two S3FS instances (or processes)
+// pointing at the same bucket do not exclude each other.
+func WithLocker(l Locker) Option {
+	return func(s *S3FS) { s.locks.ext = l }
+}
+
 // WithDiskCache stores object bodies too large for the in-memory cache as
 // files under dir, holding up to maxBytes in total, and buffers large
 // writes in spill files instead of memory. Entries are validated by ETag on
@@ -160,6 +178,7 @@ func New(client API, bucket string, opts ...Option) *S3FS {
 		bucket:     bucket,
 		ctx:        context.Background(),
 		openWrites: make(map[string]*writeFile),
+		locks:      newLockManager(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -187,14 +206,15 @@ func (s *S3FS) lookupWrite(p string) *writeFile {
 	return s.openWrites[p]
 }
 
-// Capabilities implements billy.Capable. File locks are accepted but are
-// no-ops, so LockCapability is not advertised (matching memfs).
+// Capabilities implements billy.Capable. Locks are advisory and
+// process-local unless a cross-process backend is set via WithLocker.
 func (s *S3FS) Capabilities() billy.Capability {
 	return billy.WriteCapability |
 		billy.ReadCapability |
 		billy.ReadAndWriteCapability |
 		billy.SeekCapability |
-		billy.TruncateCapability
+		billy.TruncateCapability |
+		billy.LockCapability
 }
 
 // cleanPath normalizes p to an absolute slash-separated path.
