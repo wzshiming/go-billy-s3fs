@@ -260,7 +260,20 @@ func (s *S3FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File
 		return newWriteFile(s, cleanPath(filename), flag, perm, data, true), nil
 	}
 
-	p, h, hops, err := s.resolve("open", filename)
+	var (
+		p    string
+		h    *s3.HeadObjectOutput
+		g    *s3.GetObjectOutput
+		hops int
+		err  error
+	)
+	if flag&os.O_TRUNC == 0 {
+		// the contents are needed if the object exists, so resolve with a
+		// single GetObject that brings the body along with the metadata
+		p, h, g, hops, err = s.resolveForRead("open", filename)
+	} else {
+		p, h, hops, err = s.resolve("open", filename)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -268,23 +281,34 @@ func (s *S3FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File
 		return nil, &fs.PathError{Op: "open", Path: filename, Err: ErrIsDirectory}
 	}
 	if flag&(os.O_CREATE|os.O_EXCL) == os.O_CREATE|os.O_EXCL && (h != nil || hops > 0) {
+		if g != nil {
+			g.Body.Close()
+		}
 		return nil, &fs.PathError{Op: "open", Path: filename, Err: fs.ErrExist}
 	}
 
 	writable := flag&(os.O_WRONLY|os.O_RDWR) != 0
 	if h != nil {
 		if !writable {
+			if g != nil {
+				return s.openFromGet(p, h, g)
+			}
 			if f, ok, err := s.cachedOpen(p, h); err != nil {
 				return nil, err
 			} else if ok {
 				return f, nil
 			}
-			return newReadFile(s, p, h), nil
+			return newReadFile(s, p, h, nil), nil
 		}
 		if flag&os.O_TRUNC != 0 {
 			return newWriteFile(s, p, flag, perm, nil, true), nil
 		}
-		buf, err := s.bufForExisting(p, h)
+		var buf writeBuf
+		if g != nil {
+			buf, err = s.bufFromGet(h, g)
+		} else {
+			buf, err = s.bufForExisting(p, h)
+		}
 		if err != nil {
 			if isNotFound(err) {
 				return nil, &fs.PathError{Op: "open", Path: filename, Err: fs.ErrNotExist}
