@@ -77,10 +77,7 @@ func (b *memBuf) grow(end int64) {
 		b.data = b.data[:end]
 		return
 	}
-	newCap := 2 * cap(b.data)
-	if newCap < int(end) {
-		newCap = int(end)
-	}
+	newCap := max(2*cap(b.data), int(end))
 	grown := make([]byte, end, newCap)
 	copy(grown, b.data)
 	recycleData(b.data)

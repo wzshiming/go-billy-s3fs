@@ -43,7 +43,7 @@ func newLRUIndex[V any](maxBytes int64, ttl time.Duration, onEvict func(V)) *lru
 	// MaxEntries stays 0 (unlimited); eviction is driven by the byte
 	// budget in put.
 	x.cache = &lru.Cache{
-		OnEvicted: func(_ lru.Key, value interface{}) {
+		OnEvicted: func(_ lru.Key, value any) {
 			e := value.(*lruEntry[V])
 			x.used -= e.cost
 			if x.onEvict != nil {
