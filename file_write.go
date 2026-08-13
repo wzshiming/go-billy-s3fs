@@ -106,6 +106,9 @@ type writeFile struct {
 	closed  bool
 	shared  int // open sharedReadFile handles
 	modTime time.Time
+	// spillETag is the ETag of the last spill upload, for adopting the
+	// spill file into the disk cache on Close.
+	spillETag string
 }
 
 func newWriteFile(s *S3FS, p string, flag int, perm fs.FileMode, data []byte, dirty bool) *writeFile {
@@ -154,11 +157,32 @@ func (f *writeFile) maybeSpillLocked(newEnd int64) {
 	f.buf = fb
 }
 
-// snapshot returns a copy of the current buffer.
-func (f *writeFile) snapshot() ([]byte, error) {
+// reopenState returns the mode and, when withData, a copy of the contents
+// for reopening this path through a new handle. ok=false reports that the
+// writer already closed, making the uploaded object authoritative.
+func (f *writeFile) reopenState(withData bool) (perm fs.FileMode, data []byte, ok bool, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.buf.snapshot()
+	if f.closed {
+		return 0, nil, false, nil
+	}
+	if withData {
+		if data, err = f.buf.snapshot(); err != nil {
+			return 0, nil, false, err
+		}
+	}
+	return f.perm, data, true, nil
+}
+
+// statIfOpen is Stat unless the writer already closed, when the uploaded
+// object is authoritative.
+func (f *writeFile) statIfOpen() (fs.FileInfo, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return nil, false
+	}
+	return f.statLocked(), true
 }
 
 func (f *writeFile) Name() string { return f.name }
@@ -170,12 +194,17 @@ func (f *writeFile) readable() bool {
 func (f *writeFile) Stat() (fs.FileInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.statLocked(), nil
+}
+
+// statLocked builds the FileInfo of the live buffer. Caller must hold f.mu.
+func (f *writeFile) statLocked() fs.FileInfo {
 	return &fileInfo{
 		name:    path.Base(f.name),
 		size:    f.buf.len(),
 		mode:    f.perm,
 		modTime: f.modTime,
-	}, nil
+	}
 }
 
 func (f *writeFile) Read(p []byte) (int, error) {
@@ -293,14 +322,16 @@ func (f *writeFile) flush() error {
 		return nil
 	}
 	meta := map[string]string{modeMetaKey: fmt.Sprintf("%o", f.perm)}
-	var err error
 	if data, ok := f.buf.bytes(); ok {
-		err = f.fs.put(f.fs.key(f.name), data, meta)
+		if err := f.fs.put(f.fs.key(f.name), data, meta); err != nil {
+			return err
+		}
 	} else {
-		err = f.fs.putSpill(f.fs.key(f.name), f.buf.(*fileBuf), meta)
-	}
-	if err != nil {
-		return err
+		etag, err := f.fs.putSpill(f.fs.key(f.name), f.buf.(*fileBuf), meta)
+		if err != nil {
+			return err
+		}
+		f.spillETag = etag
 	}
 	f.dirty = false
 	return nil
@@ -326,9 +357,14 @@ func (f *writeFile) Close() error {
 		return err
 	}
 	f.closed = true
+	f.fs.untrackWrite(f)
+	// adopt the spill into the disk cache only now: after a Sync the buffer
+	// can still be written, which must not mutate a hard-linked cache entry
+	if fb, ok := f.buf.(*fileBuf); ok && f.spillETag != "" {
+		f.fs.disk.adopt(f.fs.key(f.name), f.spillETag, fb.path, fb.sz)
+	}
 	// the buffer stays alive while shared readers opened on this path are
 	// still active; maybeDestroyLocked releases it once the last one closes
-	f.fs.untrackWrite(f)
 	f.maybeDestroyLocked()
 	return nil
 }
@@ -375,11 +411,17 @@ var (
 	_ billy.Locker = (*sharedReadFile)(nil)
 )
 
-func newSharedReadFile(wf *writeFile) *sharedReadFile {
+// newSharedReadFile attaches a read handle to a live writer. ok=false
+// reports that the writer already closed, making the uploaded object
+// authoritative.
+func newSharedReadFile(wf *writeFile) (*sharedReadFile, bool) {
 	wf.mu.Lock()
+	defer wf.mu.Unlock()
+	if wf.closed {
+		return nil, false
+	}
 	wf.shared++
-	wf.mu.Unlock()
-	return &sharedReadFile{wf: wf}
+	return &sharedReadFile{wf: wf}, true
 }
 
 func (f *sharedReadFile) Name() string { return f.wf.name }
@@ -402,10 +444,19 @@ func (f *sharedReadFile) Read(p []byte) (int, error) {
 }
 
 func (f *sharedReadFile) ReadAt(p []byte, off int64) (int, error) {
+	if f.isClosed() {
+		return 0, &fs.PathError{Op: "read", Path: f.wf.name, Err: fs.ErrClosed}
+	}
 	if off < 0 {
 		return 0, &fs.PathError{Op: "readat", Path: f.wf.name, Err: fs.ErrInvalid}
 	}
 	return f.wf.readAtShared(p, off)
+}
+
+func (f *sharedReadFile) isClosed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
 }
 
 func (f *sharedReadFile) Seek(offset int64, whence int) (int64, error) {

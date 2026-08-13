@@ -80,11 +80,13 @@ func (s *S3FS) put(key string, data []byte, meta map[string]string) error {
 	return nil
 }
 
-// putSpill uploads a spilled write buffer, then adopts the file into the
-// disk cache so the next open needs no download.
-func (s *S3FS) putSpill(key string, fb *fileBuf, meta map[string]string) error {
+// putSpill uploads a spilled write buffer and returns the new ETag. The
+// caller adopts the file into the disk cache once no further writes can
+// reach it; adopting here would let later writes through the same handle
+// mutate the hard-linked cache entry in place.
+func (s *S3FS) putSpill(key string, fb *fileBuf, meta map[string]string) (string, error) {
 	if _, err := fb.f.Seek(0, io.SeekStart); err != nil {
-		return err
+		return "", err
 	}
 	out, err := s.client.PutObject(s.ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
@@ -94,17 +96,16 @@ func (s *S3FS) putSpill(key string, fb *fileBuf, meta map[string]string) error {
 		Metadata:      meta,
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 	etag := aws.ToString(out.ETag)
 	if s.mem != nil {
 		s.mem.storeWrite(key, fb.sz, etag, nil, meta)
 	}
 	if s.disk != nil {
-		s.disk.dropDeleted(key)
-		s.disk.adopt(key, etag, fb.path, fb.sz)
+		s.disk.dropDeleted(key) // the upload replaced any cached body
 	}
-	return nil
+	return etag, nil
 }
 
 // spillThreshold is the write-buffer size above which contents move to a
@@ -269,7 +270,9 @@ func (s *S3FS) dirExists(p string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	exists := len(out.Contents) > 0
+	// servers may return an empty page with IsTruncated set instead of
+	// filling MaxKeys, which still proves a key under the prefix exists
+	exists := len(out.Contents) > 0 || aws.ToBool(out.IsTruncated)
 	if s.mem != nil {
 		s.mem.store(prefix, exists, nil, nil)
 	}
