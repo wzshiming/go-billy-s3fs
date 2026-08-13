@@ -22,13 +22,16 @@
 // ReadAt is then served from disk, and large write buffers spill to disk
 // instead of RAM. Entries are validated by ETag, so overwrites by other
 // clients are detected on the next (fresh) HeadObject.
+//
+// Code layout: this file defines the filesystem type and its
+// billy.Filesystem methods; s3ops.go holds the S3 request primitives and
+// cache orchestration; file_read.go and file_write.go implement the file
+// handles; mem.go, disk.go and lru.go implement the cache tiers.
 package s3fs
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io"
 	"io/fs"
 	"net/url"
 	"os"
@@ -40,8 +43,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	awshttp "github.com/aws/smithy-go/transport/http"
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/helper/chroot"
 	"github.com/go-git/go-billy/v6/util"
@@ -225,272 +226,6 @@ func (s *S3FS) listPrefix(p string) string {
 		return ""
 	}
 	return k + "/"
-}
-
-func (s *S3FS) head(key string) (*s3.HeadObjectOutput, error) {
-	if s.mem != nil {
-		if e, ok := s.mem.lookup(key); ok {
-			if !e.exists {
-				return nil, &types.NotFound{}
-			}
-			if e.head != nil {
-				return e.head, nil
-			}
-		}
-	}
-	out, err := s.client.HeadObject(s.ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
-	if s.mem != nil {
-		if err == nil {
-			s.mem.store(key, true, out, nil)
-		} else if isNotFound(err) {
-			s.mem.store(key, false, nil, nil)
-		}
-	}
-	return out, err
-}
-
-func (s *S3FS) put(key string, data []byte, meta map[string]string) error {
-	out, err := s.client.PutObject(s.ctx, &s3.PutObjectInput{
-		Bucket:   aws.String(s.bucket),
-		Key:      aws.String(key),
-		Body:     bytes.NewReader(data),
-		Metadata: meta,
-	})
-	if err != nil {
-		return err
-	}
-	if s.mem != nil {
-		body := data
-		if body == nil {
-			body = []byte{}
-		}
-		s.mem.storeWrite(key, int64(len(data)), aws.ToString(out.ETag), body, meta)
-	}
-	if s.disk != nil {
-		s.disk.dropDeleted(key) // overwrite invalidates any cached body
-	}
-	return nil
-}
-
-// putSpill uploads a spilled write buffer, then adopts the file into the
-// disk cache so the next open needs no download.
-func (s *S3FS) putSpill(key string, fb *fileBuf, meta map[string]string) error {
-	if _, err := fb.f.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	out, err := s.client.PutObject(s.ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(s.bucket),
-		Key:           aws.String(key),
-		Body:          fb.f,
-		ContentLength: aws.Int64(fb.sz),
-		Metadata:      meta,
-	})
-	if err != nil {
-		return err
-	}
-	etag := aws.ToString(out.ETag)
-	if s.mem != nil {
-		s.mem.storeWrite(key, fb.sz, etag, nil, meta)
-	}
-	if s.disk != nil {
-		s.disk.dropDeleted(key)
-		s.disk.adopt(key, etag, fb.path, fb.sz)
-	}
-	return nil
-}
-
-// spillThreshold is the write-buffer size above which contents move to a
-// spill file when the disk cache is enabled.
-func (s *S3FS) spillThreshold() int64 {
-	if s.mem != nil {
-		return s.mem.maxDataBytes()
-	}
-	return defaultSpillLimit
-}
-
-func (s *S3FS) getAll(key string) ([]byte, error) {
-	out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer out.Body.Close()
-	return io.ReadAll(out.Body)
-}
-
-// bufForExisting loads the current contents of p for a read-modify-write
-// open: into memory when small, streamed into a spill file when the disk
-// cache is enabled and the object is large.
-func (s *S3FS) bufForExisting(p string, h *s3.HeadObjectOutput) (writeBuf, error) {
-	key := s.key(p)
-	if s.disk == nil || aws.ToInt64(h.ContentLength) <= s.spillThreshold() {
-		data, err := s.getAll(key)
-		if err != nil {
-			return nil, err
-		}
-		return &memBuf{data: data}, nil
-	}
-	fb, err := s.disk.newSpill()
-	if err != nil {
-		data, gerr := s.getAll(key) // disk unusable; fall back to memory
-		if gerr != nil {
-			return nil, gerr
-		}
-		return &memBuf{data: data}, nil
-	}
-	out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		fb.destroy()
-		return nil, err
-	}
-	defer out.Body.Close()
-	n, err := io.Copy(fb.f, out.Body)
-	if err != nil {
-		fb.destroy()
-		return nil, err
-	}
-	fb.sz = n
-	return fb, nil
-}
-
-func (s *S3FS) delete(key string) error {
-	_, err := s.client.DeleteObject(s.ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
-	if err == nil && s.mem != nil {
-		s.mem.dropDeleted(key)
-	}
-	if err == nil && s.disk != nil {
-		s.disk.dropDeleted(key)
-	}
-	return err
-}
-
-func (s *S3FS) copy(srcKey, dstKey string) error {
-	segs := strings.Split(srcKey, "/")
-	for i, seg := range segs {
-		segs[i] = url.PathEscape(seg)
-	}
-	_, err := s.client.CopyObject(s.ctx, &s3.CopyObjectInput{
-		Bucket:     aws.String(s.bucket),
-		Key:        aws.String(dstKey),
-		CopySource: aws.String(s.bucket + "/" + strings.Join(segs, "/")),
-	})
-	if err == nil && s.mem != nil {
-		s.mem.storeCopied(srcKey, dstKey)
-	}
-	if err == nil && s.disk != nil {
-		s.disk.copied(srcKey, dstKey)
-	}
-	return err
-}
-
-func isNotFound(err error) bool {
-	var nf *types.NotFound
-	var nsk *types.NoSuchKey
-	if errors.As(err, &nf) || errors.As(err, &nsk) {
-		return true
-	}
-	var re *awshttp.ResponseError
-	return errors.As(err, &re) && re.HTTPStatusCode() == 404
-}
-
-// metaValue looks up a metadata key case-insensitively; S3 SDKs and
-// providers do not agree on the returned casing.
-func metaValue(meta map[string]string, key string) (string, bool) {
-	if v, ok := meta[key]; ok {
-		return v, true
-	}
-	for k, v := range meta {
-		if strings.EqualFold(k, key) {
-			return v, true
-		}
-	}
-	return "", false
-}
-
-func symlinkTarget(h *s3.HeadObjectOutput) (string, bool) {
-	if h == nil {
-		return "", false
-	}
-	enc, ok := metaValue(h.Metadata, symlinkMetaKey)
-	if !ok {
-		return "", false
-	}
-	target, err := url.QueryUnescape(enc)
-	if err != nil {
-		return "", false
-	}
-	return target, true
-}
-
-// resolve follows symlinks on the final path component. It returns the
-// resolved path, the object head if the path exists as an object, and the
-// number of symlink hops taken.
-func (s *S3FS) resolve(op, p string) (string, *s3.HeadObjectOutput, int, error) {
-	p = cleanPath(p)
-	hops := 0
-	for {
-		if p == "/" {
-			return p, nil, hops, nil
-		}
-		h, err := s.head(s.key(p))
-		if err != nil {
-			if isNotFound(err) {
-				return p, nil, hops, nil
-			}
-			return p, nil, hops, err
-		}
-		target, ok := symlinkTarget(h)
-		if !ok {
-			return p, h, hops, nil
-		}
-		hops++
-		if hops > maxSymlinkDepth {
-			return p, nil, hops, &fs.PathError{Op: op, Path: p, Err: ErrTooManySymlinks}
-		}
-		if path.IsAbs(target) {
-			p = path.Clean(target)
-		} else {
-			p = path.Join(path.Dir(p), target)
-		}
-	}
-}
-
-// dirExists reports whether p exists as a directory (marker object or any
-// key under its prefix).
-func (s *S3FS) dirExists(p string) (bool, error) {
-	if cleanPath(p) == "/" {
-		return true, nil
-	}
-	prefix := s.listPrefix(p)
-	if s.mem != nil {
-		if e, ok := s.mem.lookup(prefix); ok {
-			return e.exists, nil
-		}
-	}
-	out, err := s.client.ListObjectsV2(s.ctx, &s3.ListObjectsV2Input{
-		Bucket:  aws.String(s.bucket),
-		Prefix:  aws.String(prefix),
-		MaxKeys: aws.Int32(1),
-	})
-	if err != nil {
-		return false, err
-	}
-	exists := len(out.Contents) > 0
-	if s.mem != nil {
-		s.mem.store(prefix, exists, nil, nil)
-	}
-	return exists, nil
 }
 
 // Create implements billy.Basic.
@@ -715,28 +450,6 @@ func (s *S3FS) Rename(oldpath, newpath string) error {
 		}
 	}
 	return nil
-}
-
-func (s *S3FS) listAllKeys(prefix string) ([]string, error) {
-	var keys []string
-	in := &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.bucket),
-		Prefix: aws.String(prefix),
-	}
-	for {
-		out, err := s.client.ListObjectsV2(s.ctx, in)
-		if err != nil {
-			return nil, err
-		}
-		for _, obj := range out.Contents {
-			keys = append(keys, aws.ToString(obj.Key))
-		}
-		if !aws.ToBool(out.IsTruncated) {
-			break
-		}
-		in.ContinuationToken = out.NextContinuationToken
-	}
-	return keys, nil
 }
 
 // Remove implements billy.Basic. Removing a non-empty directory fails with

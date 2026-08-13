@@ -1,34 +1,20 @@
 package s3fs
 
 import (
-	"container/list"
-	"io"
-	"io/fs"
-	"path"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/go-git/go-billy/v6"
 )
-
-// entryOverhead approximates the fixed memory cost of a cache entry so
-// metadata-only entries still consume budget.
-const entryOverhead = 256
 
 // memEntry is the immutable cached state of one object key or directory
 // prefix (trailing "/"). exists reports whether the key was present; head is
 // set for object entries; data holds the body when it fit the cache.
 type memEntry struct {
-	key     string
-	exists  bool
-	head    *s3.HeadObjectOutput
-	data    []byte
-	expires time.Time // zero means never
-
-	elem *list.Element
-	cost int64
+	exists bool
+	head   *s3.HeadObjectOutput
+	data   []byte
 }
 
 // memCache is an LRU+TTL cache over HeadObject results, object bodies and
@@ -36,20 +22,15 @@ type memEntry struct {
 // updates replace them wholesale. Safe for concurrent use.
 type memCache struct {
 	maxBytes int64
-	ttl      time.Duration
 
-	mu      sync.Mutex
-	entries map[string]*memEntry
-	lru     *list.List // front = most recently used
-	used    int64
+	mu  sync.Mutex
+	idx *lruIndex[*memEntry]
 }
 
 func newMemCache(maxBytes int64, ttl time.Duration) *memCache {
 	return &memCache{
 		maxBytes: maxBytes,
-		ttl:      ttl,
-		entries:  make(map[string]*memEntry),
-		lru:      list.New(),
+		idx:      newLRUIndex[*memEntry](maxBytes, ttl, nil),
 	}
 }
 
@@ -62,20 +43,7 @@ func (c *memCache) maxDataBytes() int64 { return c.maxBytes / 8 }
 func (c *memCache) lookup(key string) (*memEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e := c.entries[key]
-	if e == nil {
-		return nil, false
-	}
-	if !e.validLocked() {
-		c.removeLocked(e)
-		return nil, false
-	}
-	c.lru.MoveToFront(e.elem)
-	return e, true
-}
-
-func (e *memEntry) validLocked() bool {
-	return e.expires.IsZero() || time.Now().Before(e.expires)
+	return c.idx.get(key)
 }
 
 // store inserts or replaces the entry for key. data is copied; bodies larger
@@ -92,47 +60,11 @@ func (c *memCache) store(key string, exists bool, head *s3.HeadObjectOutput, dat
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.storeLocked(key, exists, head, data)
+	c.storeLocked(key, &memEntry{exists: exists, head: head, data: data})
 }
 
-func (c *memCache) storeLocked(key string, exists bool, head *s3.HeadObjectOutput, data []byte) {
-	if old := c.entries[key]; old != nil {
-		c.removeLocked(old)
-	}
-	e := &memEntry{
-		key:    key,
-		exists: exists,
-		head:   head,
-		data:   data,
-		cost:   entryOverhead + int64(len(key)) + int64(len(data)),
-	}
-	if c.ttl > 0 {
-		e.expires = time.Now().Add(c.ttl)
-	}
-	if e.cost > c.maxBytes {
-		return
-	}
-	e.elem = c.lru.PushFront(e)
-	c.entries[key] = e
-	c.used += e.cost
-	for c.used > c.maxBytes {
-		back := c.lru.Back()
-		if back == nil {
-			break
-		}
-		c.removeLocked(back.Value.(*memEntry))
-	}
-}
-
-func (c *memCache) removeLocked(e *memEntry) {
-	if c.entries[e.key] == e {
-		delete(c.entries, e.key)
-	}
-	if e.elem != nil {
-		c.lru.Remove(e.elem)
-		e.elem = nil
-		c.used -= e.cost
-	}
+func (c *memCache) storeLocked(key string, e *memEntry) {
+	c.idx.put(key, e, entryOverhead+int64(len(key))+int64(len(e.data)))
 }
 
 // storeWrite records a successful PUT of key: the entry becomes the freshly
@@ -154,7 +86,7 @@ func (c *memCache) storeWrite(key string, size int64, etag string, data []byte, 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.storeLocked(key, true, head, body)
+	c.storeLocked(key, &memEntry{exists: true, head: head, data: body})
 	c.markDirsLocked(key)
 }
 
@@ -163,10 +95,10 @@ func (c *memCache) storeWrite(key string, size int64, etag string, data []byte, 
 func (c *memCache) storeCopied(srcKey, dstKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if src := c.entries[srcKey]; src != nil && src.exists && src.validLocked() && src.head != nil {
-		c.storeLocked(dstKey, true, src.head, src.data)
-	} else if old := c.entries[dstKey]; old != nil {
-		c.removeLocked(old) // fresh state unknown; refetch on demand
+	if src, ok := c.idx.get(srcKey); ok && src.exists && src.head != nil {
+		c.storeLocked(dstKey, &memEntry{exists: true, head: src.head, data: src.data})
+	} else {
+		c.idx.delete(dstKey) // fresh state unknown; refetch on demand
 	}
 	c.markDirsLocked(dstKey)
 }
@@ -176,15 +108,10 @@ func (c *memCache) storeCopied(srcKey, dstKey string) {
 func (c *memCache) dropDeleted(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if e := c.entries[key]; e != nil {
-		c.removeLocked(e)
-	}
+	c.idx.delete(key)
 	for i := 0; i < len(key); i++ {
-		if key[i] != '/' {
-			continue
-		}
-		if e := c.entries[key[:i+1]]; e != nil {
-			c.removeLocked(e)
+		if key[i] == '/' {
+			c.idx.delete(key[:i+1])
 		}
 	}
 }
@@ -196,153 +123,9 @@ func (c *memCache) markDirsLocked(key string) {
 			continue
 		}
 		p := key[:i+1]
-		if e := c.entries[p]; e != nil && e.exists && e.validLocked() {
+		if e, ok := c.idx.get(p); ok && e.exists {
 			continue
 		}
-		c.storeLocked(p, true, nil, nil)
+		c.storeLocked(p, &memEntry{exists: true})
 	}
 }
-
-// cachedOpen serves an O_RDONLY open from the local tiers: the memory cache
-// for bodies that fit it, the disk cache for anything larger. ok=false
-// means the caller should stream from S3.
-func (s *S3FS) cachedOpen(p string, h *s3.HeadObjectOutput) (billy.File, bool, error) {
-	size := aws.ToInt64(h.ContentLength)
-	key := s.key(p)
-	if s.mem != nil && size <= s.mem.maxDataBytes() {
-		if e, ok := s.mem.lookup(key); ok && e.exists && e.data != nil {
-			return newMemReadFile(p, infoFromHeadValue(path.Base(p), h), e.data), true, nil
-		}
-		data, err := s.getAll(key)
-		if err != nil {
-			if isNotFound(err) {
-				return nil, false, &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist}
-			}
-			return nil, false, err
-		}
-		s.mem.store(key, true, h, data)
-		return newMemReadFile(p, infoFromHeadValue(path.Base(p), h), data), true, nil
-	}
-	if s.disk != nil && size+entryOverhead <= s.disk.maxBytes {
-		if f, ok := s.disk.open(key, aws.ToString(h.ETag)); ok {
-			info := infoFromHeadValue(path.Base(p), h)
-			return newDiskReadFile(f, p, info), true, nil
-		}
-		return s.diskFetch(key, h, p)
-	}
-	return nil, false, nil
-}
-
-// memReadFile is a read-only billy.File over a cached object body. data is
-// shared with the cache and must not be mutated.
-type memReadFile struct {
-	name string
-	info fileInfo
-	data []byte
-
-	mu     sync.Mutex
-	pos    int64
-	closed bool
-}
-
-var (
-	_ billy.File   = (*memReadFile)(nil)
-	_ billy.Locker = (*memReadFile)(nil)
-)
-
-func newMemReadFile(name string, info fileInfo, data []byte) *memReadFile {
-	return &memReadFile{name: name, info: info, data: data}
-}
-
-func (f *memReadFile) Name() string { return f.name }
-
-func (f *memReadFile) Stat() (fs.FileInfo, error) {
-	info := f.info
-	return &info, nil
-}
-
-func (f *memReadFile) Read(p []byte) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return 0, &fs.PathError{Op: "read", Path: f.name, Err: fs.ErrClosed}
-	}
-	if f.pos >= int64(len(f.data)) {
-		return 0, io.EOF
-	}
-	n := copy(p, f.data[f.pos:])
-	f.pos += int64(n)
-	return n, nil
-}
-
-func (f *memReadFile) ReadAt(p []byte, off int64) (int, error) {
-	f.mu.Lock()
-	closed := f.closed
-	f.mu.Unlock()
-	if closed {
-		return 0, &fs.PathError{Op: "read", Path: f.name, Err: fs.ErrClosed}
-	}
-	if off < 0 {
-		return 0, &fs.PathError{Op: "readat", Path: f.name, Err: fs.ErrInvalid}
-	}
-	if off >= int64(len(f.data)) {
-		return 0, io.EOF
-	}
-	n := copy(p, f.data[off:])
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
-}
-
-func (f *memReadFile) Seek(offset int64, whence int) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return 0, &fs.PathError{Op: "seek", Path: f.name, Err: fs.ErrClosed}
-	}
-	var abs int64
-	switch whence {
-	case io.SeekStart:
-		abs = offset
-	case io.SeekCurrent:
-		abs = f.pos + offset
-	case io.SeekEnd:
-		abs = int64(len(f.data)) + offset
-	default:
-		return 0, &fs.PathError{Op: "seek", Path: f.name, Err: fs.ErrInvalid}
-	}
-	if abs < 0 {
-		return 0, &fs.PathError{Op: "seek", Path: f.name, Err: fs.ErrInvalid}
-	}
-	f.pos = abs
-	return abs, nil
-}
-
-func (f *memReadFile) Write(p []byte) (int, error) {
-	return 0, &fs.PathError{Op: "write", Path: f.name, Err: fs.ErrPermission}
-}
-
-func (f *memReadFile) WriteAt(p []byte, off int64) (int, error) {
-	return 0, &fs.PathError{Op: "writeat", Path: f.name, Err: fs.ErrPermission}
-}
-
-func (f *memReadFile) Truncate(size int64) error {
-	return &fs.PathError{Op: "truncate", Path: f.name, Err: fs.ErrPermission}
-}
-
-func (f *memReadFile) Close() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return &fs.PathError{Op: "close", Path: f.name, Err: fs.ErrClosed}
-	}
-	f.closed = true
-	return nil
-}
-
-// Lock implements billy.Locker as a no-op.
-func (f *memReadFile) Lock() error { return nil }
-
-// Unlock implements billy.Locker as a no-op.
-func (f *memReadFile) Unlock() error { return nil }

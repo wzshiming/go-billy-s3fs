@@ -9,6 +9,7 @@ require (
 	github.com/aws/smithy-go v1.27.7
 	github.com/go-git/go-billy/v6 v6.0.0-alpha.2
 	github.com/go-git/go-git/v6 v6.0.0-alpha.5
+	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/johannesboyne/gofakes3 v1.2.0
 )
 
