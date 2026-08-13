@@ -117,6 +117,49 @@ func TestDiskSpillWriteAdoptedIntoCache(t *testing.T) {
 	}
 }
 
+// TestDiskSpillNotAdoptedOnSync verifies a Sync does not hard-link the live
+// spill buffer into the disk cache: later writes through the same handle
+// would mutate the cached body in place behind its ETag.
+func TestDiskSpillNotAdoptedOnSync(t *testing.T) {
+	client := newCountingClient(newTestClient(t))
+	dir := t.TempDir()
+	bfs := s3fs.New(client, testBucket, tinyMemOpts(dir)...)
+	part := bytes.Repeat([]byte("sync-me!!"), 1000) // 9KB > 1KB threshold
+
+	f, err := bfs.Create("big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(part); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.(billy.Syncer).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(dirFiles(t, dir, "s3fs-c-*")); n != 0 {
+		t.Fatalf("cache files after sync = %d, want 0", n)
+	}
+	// mutate the buffer after the sync; the synced upload must stay intact
+	if _, err := f.(io.WriterAt).WriteAt([]byte("XXXX"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// the close flushed the mutation and adopted the final body
+	if n := len(dirFiles(t, dir, "s3fs-c-*")); n != 1 {
+		t.Fatalf("cache files after close = %d, want 1", n)
+	}
+	gets := client.count("GetObject")
+	want := string(append([]byte("XXXX"), part[4:]...))
+	if got := readFull(t, bfs, "big.bin"); got != want {
+		t.Fatal("content mismatch after sync+write+close")
+	}
+	if n := client.count("GetObject") - gets; n != 0 {
+		t.Fatalf("GetObject after adopted close = %d, want 0", n)
+	}
+}
+
 // TestDiskCacheSurvivesRename verifies the go-git packfile flow: write a
 // temp file (spilled), rename it into place, then read it back without any
 // download thanks to the hard-linked cache entry.

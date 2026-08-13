@@ -1,6 +1,7 @@
 package s3fs_test
 
 import (
+	"context"
 	"errors"
 	"io"
 	"io/fs"
@@ -608,5 +609,169 @@ func TestFileStatAndMode(t *testing.T) {
 	}
 	if fi2.Size() != int64(len("#!/bin/sh")) {
 		t.Fatalf("file stat size = %d", fi2.Size())
+	}
+}
+
+// TestReopenPreservesMode verifies that opening an existing file for write
+// keeps its stored permission bits: perm applies only when a file is created.
+func TestReopenPreservesMode(t *testing.T) {
+	bfs := newTestFS(t)
+	wantMode := func(name string, want fs.FileMode) {
+		t.Helper()
+		fi, err := bfs.Stat(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != want {
+			t.Fatalf("mode = %v, want %v", fi.Mode().Perm(), want)
+		}
+	}
+
+	f, err := bfs.OpenFile("exec.sh", os.O_CREATE|os.O_WRONLY, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("#!/bin/sh")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// read-modify-write reopen with zero perm
+	f, err = bfs.OpenFile("exec.sh", os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("\necho hi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wantMode("exec.sh", 0o755)
+
+	// truncating reopen with a different perm
+	f, err = bfs.OpenFile("exec.sh", os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wantMode("exec.sh", 0o755)
+
+	// reopen of a file still open for write in this instance
+	f1, err := bfs.OpenFile("inflight.sh", os.O_CREATE|os.O_WRONLY, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2, err := bfs.OpenFile("inflight.sh", os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f2.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	wantMode("inflight.sh", 0o700)
+	if err := f2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wantMode("inflight.sh", 0o700)
+}
+
+// TestSharedReadHandleClosed verifies a read handle over a live write
+// buffer rejects use after Close, including ReadAt.
+func TestSharedReadHandleClosed(t *testing.T) {
+	bfs := newTestFS(t)
+	w, err := bfs.Create("live.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	r, err := bfs.Open("live.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := r.ReadAt(buf, 0); !errors.Is(err, fs.ErrClosed) {
+		t.Fatalf("ReadAt after close err = %v, want ErrClosed", err)
+	}
+	if _, err := r.Read(buf); !errors.Is(err, fs.ErrClosed) {
+		t.Fatalf("Read after close err = %v, want ErrClosed", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// truncListClient rewrites ListObjectsV2 responses to emulate S3-compatible
+// servers that return fewer keys than MaxKeys with IsTruncated set.
+type truncListClient struct {
+	s3fs.API
+	rewrite func(in *s3.ListObjectsV2Input, out *s3.ListObjectsV2Output)
+}
+
+func (c *truncListClient) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	out, err := c.API.ListObjectsV2(ctx, in, opts...)
+	if err == nil {
+		c.rewrite(in, out)
+	}
+	return out, err
+}
+
+// TestRemoveDirTruncatedPage verifies Remove refuses to delete a directory
+// when the emptiness-check page is truncated, instead of dropping the
+// marker of a non-empty directory.
+func TestRemoveDirTruncatedPage(t *testing.T) {
+	client := &truncListClient{API: newTestClient(t), rewrite: func(in *s3.ListObjectsV2Input, out *s3.ListObjectsV2Output) {
+		if aws.ToInt32(in.MaxKeys) == 2 && len(out.Contents) > 1 {
+			out.Contents = out.Contents[:1]
+			out.IsTruncated = aws.Bool(true)
+		}
+	}}
+	bfs := s3fs.New(client, testBucket)
+	if err := bfs.MkdirAll("d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFull(t, bfs, "d/child", "x")
+
+	if err := bfs.Remove("d"); !errors.Is(err, s3fs.ErrDirNotEmpty) {
+		t.Fatalf("Remove = %v, want ErrDirNotEmpty", err)
+	}
+	if fi, err := bfs.Stat("d"); err != nil || !fi.IsDir() {
+		t.Fatalf("directory marker lost: fi=%v err=%v", fi, err)
+	}
+	if got := readFull(t, bfs, "d/child"); got != "x" {
+		t.Fatalf("child content = %q", got)
+	}
+}
+
+// TestDirExistsTruncatedEmptyPage verifies an empty listing page with
+// IsTruncated set still counts as proof that the directory exists.
+func TestDirExistsTruncatedEmptyPage(t *testing.T) {
+	client := &truncListClient{API: newTestClient(t), rewrite: func(in *s3.ListObjectsV2Input, out *s3.ListObjectsV2Output) {
+		if aws.ToInt32(in.MaxKeys) == 1 && len(out.Contents) > 0 {
+			out.Contents = nil
+			out.IsTruncated = aws.Bool(true)
+		}
+	}}
+	bfs := s3fs.New(client, testBucket)
+	writeFull(t, bfs, "d/child", "x")
+
+	fi, err := bfs.Stat("d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.IsDir() {
+		t.Fatalf("IsDir = false, want true")
 	}
 }

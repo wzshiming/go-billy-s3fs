@@ -247,17 +247,16 @@ func (s *S3FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File
 			return nil, &fs.PathError{Op: "open", Path: filename, Err: fs.ErrExist}
 		}
 		if flag&(os.O_WRONLY|os.O_RDWR) == 0 {
-			return newSharedReadFile(wf), nil
-		}
-		var data []byte
-		if flag&os.O_TRUNC == 0 {
-			var err error
-			data, err = wf.snapshot()
-			if err != nil {
-				return nil, err
+			if rf, ok := newSharedReadFile(wf); ok {
+				return rf, nil
 			}
+		} else if wfPerm, data, ok, err := wf.reopenState(flag&os.O_TRUNC == 0); err != nil {
+			return nil, err
+		} else if ok {
+			// the file exists, so its mode is kept and perm is ignored
+			return newWriteFile(s, cleanPath(filename), flag, wfPerm, data, true), nil
 		}
-		return newWriteFile(s, cleanPath(filename), flag, perm, data, true), nil
+		// the writer closed in between; the uploaded object serves this open
 	}
 
 	var (
@@ -300,6 +299,8 @@ func (s *S3FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File
 			}
 			return newReadFile(s, p, h, nil), nil
 		}
+		// the file exists, so its stored mode is kept and perm is ignored
+		perm = modeFromHead(h)
 		if flag&os.O_TRUNC != 0 {
 			return newWriteFile(s, p, flag, perm, nil, true), nil
 		}
@@ -332,7 +333,10 @@ func (s *S3FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File
 // Stat implements billy.Basic, following symlinks.
 func (s *S3FS) Stat(filename string) (fs.FileInfo, error) {
 	if wf := s.lookupWrite(cleanPath(filename)); wf != nil {
-		return wf.Stat()
+		if fi, ok := wf.statIfOpen(); ok {
+			return fi, nil
+		}
+		// the writer closed in between; the uploaded object is authoritative
 	}
 	p, h, _, err := s.resolve("stat", filename)
 	if err != nil {
@@ -497,6 +501,10 @@ func (s *S3FS) Remove(filename string) error {
 	})
 	if err != nil {
 		return err
+	}
+	if aws.ToBool(out.IsTruncated) {
+		// more keys follow beyond this page, so the directory is not empty
+		return &fs.PathError{Op: "remove", Path: filename, Err: ErrDirNotEmpty}
 	}
 	if len(out.Contents) == 0 {
 		return &fs.PathError{Op: "remove", Path: filename, Err: fs.ErrNotExist}
