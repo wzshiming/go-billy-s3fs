@@ -31,7 +31,7 @@ func TestGoGitEndToEnd(t *testing.T) {
 func testGoGitEndToEnd(t *testing.T, opts []s3fs.Option) {
 	client := newTestClient(t)
 	newFS := func() *s3fs.S3FS {
-		return s3fs.New(client, testBucket, append([]s3fs.Option{s3fs.WithPrefix("repos/demo.git")}, opts...)...)
+		return s3fs.New(testBucket, append([]s3fs.Option{s3fs.WithClient(client), s3fs.WithPrefix("repos/demo.git")}, opts...)...)
 	}
 	bfs := newFS()
 
@@ -162,7 +162,7 @@ func TestGoGitBare(t *testing.T) {
 func testGoGitBare(t *testing.T, opts []s3fs.Option) {
 	client := newTestClient(t)
 	newFS := func() *s3fs.S3FS {
-		return s3fs.New(client, testBucket, append([]s3fs.Option{s3fs.WithPrefix("bare.git")}, opts...)...)
+		return s3fs.New(testBucket, append([]s3fs.Option{s3fs.WithClient(client), s3fs.WithPrefix("bare.git")}, opts...)...)
 	}
 	bfs := newFS()
 	st := filesystem.NewStorage(bfs, cache.NewObjectLRUDefault())

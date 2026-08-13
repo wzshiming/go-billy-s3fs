@@ -39,7 +39,7 @@ const (
 // lease-based locks it is advisory, and a holder that cannot renew (e.g.
 // network outage longer than the TTL) silently loses the lock.
 type S3Locker struct {
-	client API
+	client Client
 	bucket string
 	prefix string
 	ttl    time.Duration
@@ -95,7 +95,7 @@ func WithLockPoll(poll time.Duration) S3LockerOption {
 // NewS3Locker returns a Locker storing lock objects in the given bucket.
 // Multiple processes must use the same bucket and prefix for locks to be
 // mutual.
-func NewS3Locker(client API, bucket string, opts ...S3LockerOption) *S3Locker {
+func NewS3Locker(client Client, bucket string, opts ...S3LockerOption) *S3Locker {
 	l := &S3Locker{
 		client: client,
 		bucket: bucket,

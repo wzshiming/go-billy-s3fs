@@ -19,13 +19,13 @@ import (
 
 // countingClient wraps an s3fs.API and counts calls per operation.
 type countingClient struct {
-	s3fs.API
+	s3fs.Client
 	mu    sync.Mutex
 	calls map[string]int
 }
 
-func newCountingClient(inner s3fs.API) *countingClient {
-	return &countingClient{API: inner, calls: map[string]int{}}
+func newCountingClient(inner s3fs.Client) *countingClient {
+	return &countingClient{Client: inner, calls: map[string]int{}}
 }
 
 func (c *countingClient) record(op string) {
@@ -52,39 +52,39 @@ func (c *countingClient) total() int {
 
 func (c *countingClient) HeadObject(ctx context.Context, in *s3.HeadObjectInput, opts ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
 	c.record("HeadObject")
-	return c.API.HeadObject(ctx, in, opts...)
+	return c.Client.HeadObject(ctx, in, opts...)
 }
 
 func (c *countingClient) GetObject(ctx context.Context, in *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	c.record("GetObject")
-	return c.API.GetObject(ctx, in, opts...)
+	return c.Client.GetObject(ctx, in, opts...)
 }
 
 func (c *countingClient) PutObject(ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	c.record("PutObject")
-	return c.API.PutObject(ctx, in, opts...)
+	return c.Client.PutObject(ctx, in, opts...)
 }
 
 func (c *countingClient) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
 	c.record("DeleteObject")
-	return c.API.DeleteObject(ctx, in, opts...)
+	return c.Client.DeleteObject(ctx, in, opts...)
 }
 
 func (c *countingClient) CopyObject(ctx context.Context, in *s3.CopyObjectInput, opts ...func(*s3.Options)) (*s3.CopyObjectOutput, error) {
 	c.record("CopyObject")
-	return c.API.CopyObject(ctx, in, opts...)
+	return c.Client.CopyObject(ctx, in, opts...)
 }
 
 func (c *countingClient) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
 	c.record("ListObjectsV2")
-	return c.API.ListObjectsV2(ctx, in, opts...)
+	return c.Client.ListObjectsV2(ctx, in, opts...)
 }
 
 // TestCacheReadAfterWrite verifies write-through caching: after a write via
 // the filesystem, reads and stats are served without any S3 round trips.
 func TestCacheReadAfterWrite(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
-	bfs := s3fs.New(client, testBucket, s3fs.WithMemCache(64<<20, 0))
+	bfs := s3fs.New(testBucket, s3fs.WithClient(client), s3fs.WithMemCache(64<<20, 0))
 
 	writeFull(t, bfs, "dir/a.txt", "hello cache")
 
@@ -107,7 +107,7 @@ func TestCacheReadAfterWrite(t *testing.T) {
 // negative entry does not mask a later create.
 func TestCacheNegativeStat(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
-	bfs := s3fs.New(client, testBucket, s3fs.WithMemCache(64<<20, 0))
+	bfs := s3fs.New(testBucket, s3fs.WithClient(client), s3fs.WithMemCache(64<<20, 0))
 
 	if _, err := bfs.Stat("missing.txt"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("first stat err = %v", err)
@@ -167,7 +167,7 @@ func TestCacheTTL(t *testing.T) {
 	}
 
 	t.Run("zero ttl keeps entries", func(t *testing.T) {
-		bfs := s3fs.New(raw, testBucket, s3fs.WithPrefix("forever"), s3fs.WithMemCache(64<<20, 0))
+		bfs := s3fs.New(testBucket, s3fs.WithClient(raw), s3fs.WithPrefix("forever"), s3fs.WithMemCache(64<<20, 0))
 		writeFull(t, bfs, "f", "v1")
 		extPut(t, "forever/f", "v2") // bypasses this instance's cache
 		if got := readFull(t, bfs, "f"); got != "v1" {
@@ -176,7 +176,7 @@ func TestCacheTTL(t *testing.T) {
 	})
 
 	t.Run("expired entries refetch", func(t *testing.T) {
-		bfs := s3fs.New(raw, testBucket, s3fs.WithPrefix("expiring"), s3fs.WithMemCache(64<<20, time.Nanosecond))
+		bfs := s3fs.New(testBucket, s3fs.WithClient(raw), s3fs.WithPrefix("expiring"), s3fs.WithMemCache(64<<20, time.Nanosecond))
 		writeFull(t, bfs, "f", "v1")
 		extPut(t, "expiring/f", "v2")
 		time.Sleep(time.Millisecond) // let the entry expire
@@ -191,7 +191,7 @@ func TestCacheTTL(t *testing.T) {
 func TestCacheBigObjectStreams(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
 	// 4KiB budget: bodies over 512B always stream
-	bfs := s3fs.New(client, testBucket, s3fs.WithMemCache(4096, 0))
+	bfs := s3fs.New(testBucket, s3fs.WithClient(client), s3fs.WithMemCache(4096, 0))
 
 	big := strings.Repeat("x", 10_000)
 	writeFull(t, bfs, "big.bin", big)
@@ -210,7 +210,7 @@ func TestCacheBigObjectStreams(t *testing.T) {
 // read-modify-write opens, including through symlinks.
 func TestOpenSingleGetObject(t *testing.T) {
 	client := newCountingClient(newTestClient(t))
-	bfs := s3fs.New(client, testBucket)
+	bfs := s3fs.New(testBucket, s3fs.WithClient(client))
 
 	writeFull(t, bfs, "dir/a.txt", "hello")
 	if err := bfs.Symlink("a.txt", "dir/link"); err != nil {
