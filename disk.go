@@ -1,26 +1,26 @@
 package s3fs
 
 import (
-	"container/list"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/go-git/go-billy/v6"
 )
 
 // defaultSpillLimit is the write-buffer size above which contents move to a
 // spill file when the disk cache is enabled and no memory cache sets the
 // threshold.
 const defaultSpillLimit = 8 << 20
+
+// diskEntry locates the cached body of one object key on disk.
+type diskEntry struct {
+	etag string
+	size int64
+	path string
+}
 
 // diskCache stores object bodies as local files, serving opens of objects
 // too large for the in-memory cache. Entries are validated by ETag on every
@@ -31,35 +31,23 @@ const defaultSpillLimit = 8 << 20
 type diskCache struct {
 	dir      string
 	maxBytes int64
-	ttl      time.Duration
 
 	initOnce sync.Once
 	initErr  error
 	seq      atomic.Int64
 
-	mu      sync.Mutex
-	entries map[string]*diskEntry // by object key
-	lru     *list.List            // front = most recently used
-	used    int64
-}
-
-type diskEntry struct {
-	key     string
-	etag    string
-	size    int64
-	path    string
-	expires time.Time // zero means never
-	elem    *list.Element
-	cost    int64
+	mu  sync.Mutex
+	idx *lruIndex[*diskEntry]
 }
 
 func newDiskCache(dir string, maxBytes int64, ttl time.Duration) *diskCache {
 	return &diskCache{
 		dir:      dir,
 		maxBytes: maxBytes,
-		ttl:      ttl,
-		entries:  make(map[string]*diskEntry),
-		lru:      list.New(),
+		idx: newLRUIndex(maxBytes, ttl, func(e *diskEntry) {
+			// open handles keep reading the unlinked inode (POSIX semantics)
+			os.Remove(e.path)
+		}),
 	}
 }
 
@@ -93,25 +81,19 @@ func (c *diskCache) open(key, etag string) (*os.File, bool) {
 		return nil, false
 	}
 	c.mu.Lock()
-	e := c.entries[key]
-	if e == nil || e.etag != etag {
+	e, ok := c.idx.get(key)
+	if !ok || e.etag != etag {
 		c.mu.Unlock()
 		return nil, false
 	}
-	if !e.validLocked() {
-		c.removeLocked(e)
-		c.mu.Unlock()
-		return nil, false
-	}
-	c.lru.MoveToFront(e.elem)
 	p := e.path
 	c.mu.Unlock()
 
 	f, err := os.Open(p)
 	if err != nil {
 		c.mu.Lock()
-		if c.entries[key] == e {
-			c.removeLocked(e)
+		if cur, ok := c.idx.get(key); ok && cur == e {
+			c.idx.delete(key)
 		}
 		c.mu.Unlock()
 		return nil, false
@@ -119,60 +101,20 @@ func (c *diskCache) open(key, etag string) (*os.File, bool) {
 	return f, true
 }
 
-func (e *diskEntry) validLocked() bool {
-	return e.expires.IsZero() || time.Now().Before(e.expires)
-}
-
 // insert registers path as the cached body of key, replacing any previous
 // entry and evicting least-recently-used files over budget. The cache owns
 // the file afterwards.
 func (c *diskCache) insert(key, etag, path string, size int64) {
-	e := &diskEntry{key: key, etag: etag, size: size, path: path, cost: size + entryOverhead}
-	if c.ttl > 0 {
-		e.expires = time.Now().Add(c.ttl)
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if old := c.entries[key]; old != nil {
-		c.removeLocked(old)
-	}
-	if e.cost > c.maxBytes {
-		os.Remove(path)
-		return
-	}
-	e.elem = c.lru.PushFront(e)
-	c.entries[key] = e
-	c.used += e.cost
-	for c.used > c.maxBytes {
-		back := c.lru.Back()
-		if back == nil {
-			break
-		}
-		c.removeLocked(back.Value.(*diskEntry))
-	}
-}
-
-// removeLocked drops the entry and unlinks its file; open handles keep
-// reading the unlinked inode (POSIX semantics).
-func (c *diskCache) removeLocked(e *diskEntry) {
-	if c.entries[e.key] == e {
-		delete(c.entries, e.key)
-	}
-	if e.elem != nil {
-		c.lru.Remove(e.elem)
-		e.elem = nil
-		c.used -= e.cost
-	}
-	os.Remove(e.path)
+	c.idx.put(key, &diskEntry{etag: etag, size: size, path: path}, size+entryOverhead)
 }
 
 // dropDeleted invalidates the entry for key after a delete or overwrite.
 func (c *diskCache) dropDeleted(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if e := c.entries[key]; e != nil {
-		c.removeLocked(e)
-	}
+	c.idx.delete(key)
 }
 
 // copied mirrors a server-side copy: dst gets a hard link to src's cached
@@ -180,11 +122,9 @@ func (c *diskCache) dropDeleted(key string) {
 // into place).
 func (c *diskCache) copied(srcKey, dstKey string) {
 	c.mu.Lock()
-	src := c.entries[srcKey]
-	if src == nil {
-		if old := c.entries[dstKey]; old != nil {
-			c.removeLocked(old)
-		}
+	src, ok := c.idx.get(srcKey)
+	if !ok {
+		c.idx.delete(dstKey)
 		c.mu.Unlock()
 		return
 	}
@@ -211,167 +151,6 @@ func (c *diskCache) adopt(key, etag, srcPath string, size int64) {
 	}
 	c.insert(key, etag, dstPath, size)
 }
-
-// diskFetch streams the object into the disk cache and returns a handle
-// serving it. ok=false means the caller should stream from S3 instead.
-func (s *S3FS) diskFetch(key string, h *s3.HeadObjectOutput, p string) (billy.File, bool, error) {
-	c := s.disk
-	if c.ensure() != nil {
-		return nil, false, nil
-	}
-	out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		if isNotFound(err) {
-			return nil, false, &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist}
-		}
-		return nil, false, err
-	}
-	defer out.Body.Close()
-
-	tmp := c.newPath("c")
-	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return nil, false, nil // disk unusable; stream instead
-	}
-	size, err := io.Copy(f, out.Body)
-	if err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return nil, false, err
-	}
-	info := infoFromHeadValue(path.Base(p), h)
-	info.size = size
-	etag := aws.ToString(out.ETag)
-	if etag == "" {
-		etag = aws.ToString(h.ETag)
-	}
-	if etag == "" {
-		// cannot validate later; serve this handle but do not cache
-		os.Remove(tmp)
-		return newDiskReadFile(f, p, info), true, nil
-	}
-	c.insert(key, etag, tmp, size)
-	return newDiskReadFile(f, p, info), true, nil
-}
-
-// diskReadFile is a read-only billy.File over a locally cached object body.
-// All reads use pread, so ReadAt is safe for concurrent use.
-type diskReadFile struct {
-	f    *os.File
-	name string
-	info fileInfo
-
-	mu     sync.Mutex
-	pos    int64
-	closed bool
-}
-
-var (
-	_ billy.File   = (*diskReadFile)(nil)
-	_ billy.Locker = (*diskReadFile)(nil)
-)
-
-func newDiskReadFile(f *os.File, name string, info fileInfo) *diskReadFile {
-	return &diskReadFile{f: f, name: name, info: info}
-}
-
-func (f *diskReadFile) Name() string { return f.name }
-
-func (f *diskReadFile) Stat() (fs.FileInfo, error) {
-	info := f.info
-	return &info, nil
-}
-
-func (f *diskReadFile) Read(p []byte) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return 0, &fs.PathError{Op: "read", Path: f.name, Err: fs.ErrClosed}
-	}
-	if f.pos >= f.info.size {
-		return 0, io.EOF
-	}
-	n, err := f.f.ReadAt(p, f.pos)
-	f.pos += int64(n)
-	if err == io.EOF && n > 0 {
-		err = nil
-	}
-	return n, err
-}
-
-func (f *diskReadFile) ReadAt(p []byte, off int64) (int, error) {
-	f.mu.Lock()
-	closed := f.closed
-	f.mu.Unlock()
-	if closed {
-		return 0, &fs.PathError{Op: "read", Path: f.name, Err: fs.ErrClosed}
-	}
-	if off < 0 {
-		return 0, &fs.PathError{Op: "readat", Path: f.name, Err: fs.ErrInvalid}
-	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if off >= f.info.size {
-		return 0, io.EOF
-	}
-	return f.f.ReadAt(p, off)
-}
-
-func (f *diskReadFile) Seek(offset int64, whence int) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return 0, &fs.PathError{Op: "seek", Path: f.name, Err: fs.ErrClosed}
-	}
-	var abs int64
-	switch whence {
-	case io.SeekStart:
-		abs = offset
-	case io.SeekCurrent:
-		abs = f.pos + offset
-	case io.SeekEnd:
-		abs = f.info.size + offset
-	default:
-		return 0, &fs.PathError{Op: "seek", Path: f.name, Err: fs.ErrInvalid}
-	}
-	if abs < 0 {
-		return 0, &fs.PathError{Op: "seek", Path: f.name, Err: fs.ErrInvalid}
-	}
-	f.pos = abs
-	return abs, nil
-}
-
-func (f *diskReadFile) Write(p []byte) (int, error) {
-	return 0, &fs.PathError{Op: "write", Path: f.name, Err: fs.ErrPermission}
-}
-
-func (f *diskReadFile) WriteAt(p []byte, off int64) (int, error) {
-	return 0, &fs.PathError{Op: "writeat", Path: f.name, Err: fs.ErrPermission}
-}
-
-func (f *diskReadFile) Truncate(size int64) error {
-	return &fs.PathError{Op: "truncate", Path: f.name, Err: fs.ErrPermission}
-}
-
-func (f *diskReadFile) Close() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return &fs.PathError{Op: "close", Path: f.name, Err: fs.ErrClosed}
-	}
-	f.closed = true
-	return f.f.Close()
-}
-
-// Lock implements billy.Locker as a no-op.
-func (f *diskReadFile) Lock() error { return nil }
-
-// Unlock implements billy.Locker as a no-op.
-func (f *diskReadFile) Unlock() error { return nil }
 
 // fileBuf is a writeFile buffer spilled to a local file. All access is
 // offset-based, so uploads reading the same fd do not disturb it.
