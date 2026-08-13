@@ -569,12 +569,10 @@ func TestCapabilities(t *testing.T) {
 	bfs := newTestFS(t)
 	caps := billy.Capabilities(bfs)
 	need := billy.WriteCapability | billy.ReadCapability |
-		billy.ReadAndWriteCapability | billy.SeekCapability | billy.TruncateCapability
+		billy.ReadAndWriteCapability | billy.SeekCapability |
+		billy.TruncateCapability | billy.LockCapability
 	if caps&need != need {
 		t.Fatalf("caps = %b", caps)
-	}
-	if caps&billy.LockCapability != 0 {
-		t.Fatal("lock capability should not be advertised")
 	}
 }
 

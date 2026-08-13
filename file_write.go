@@ -358,6 +358,7 @@ func (f *writeFile) Close() error {
 	}
 	f.closed = true
 	f.fs.untrackWrite(f)
+	f.fs.locks.releaseOnClose(f.fs.ctx, f.name, f)
 	// adopt the spill into the disk cache only now: after a Sync the buffer
 	// can still be written, which must not mutate a hard-linked cache entry
 	if fb, ok := f.buf.(*fileBuf); ok && f.spillETag != "" {
@@ -389,11 +390,34 @@ func (f *writeFile) readAtShared(p []byte, off int64) (int, error) {
 	return f.buf.readAt(p, off)
 }
 
-// Lock implements billy.Locker as a no-op.
-func (f *writeFile) Lock() error { return nil }
+// Lock implements billy.Locker with flock-like semantics: exclusive,
+// blocking, reentrant per handle and released on Close.
+func (f *writeFile) Lock() error {
+	f.mu.Lock()
+	closed := f.closed
+	f.mu.Unlock()
+	if closed {
+		return &fs.PathError{Op: "lock", Path: f.name, Err: fs.ErrClosed}
+	}
+	if err := f.fs.locks.lock(f.fs.ctx, f.name, f); err != nil {
+		return &fs.PathError{Op: "lock", Path: f.name, Err: err}
+	}
+	return nil
+}
 
-// Unlock implements billy.Locker as a no-op.
-func (f *writeFile) Unlock() error { return nil }
+// Unlock implements billy.Locker; unlocking a lock not held is a no-op.
+func (f *writeFile) Unlock() error {
+	f.mu.Lock()
+	closed := f.closed
+	f.mu.Unlock()
+	if closed {
+		return &fs.PathError{Op: "unlock", Path: f.name, Err: fs.ErrClosed}
+	}
+	if err := f.fs.locks.unlock(f.fs.ctx, f.name, f); err != nil {
+		return &fs.PathError{Op: "unlock", Path: f.name, Err: err}
+	}
+	return nil
+}
 
 // sharedReadFile is a read-only handle over a file currently open for write
 // in the same S3FS instance. Reads observe the live buffer, matching OS
@@ -499,11 +523,31 @@ func (f *sharedReadFile) Close() error {
 	f.wf.shared--
 	f.wf.maybeDestroyLocked()
 	f.wf.mu.Unlock()
+	f.wf.fs.locks.releaseOnClose(f.wf.fs.ctx, f.wf.name, f)
 	return nil
 }
 
-// Lock implements billy.Locker as a no-op.
-func (f *sharedReadFile) Lock() error { return nil }
+// Lock implements billy.Locker with flock-like semantics; this handle
+// contends with its writer and any other handle on the same path.
+func (f *sharedReadFile) Lock() error {
+	if f.isClosed() {
+		return &fs.PathError{Op: "lock", Path: f.wf.name, Err: fs.ErrClosed}
+	}
+	s := f.wf.fs
+	if err := s.locks.lock(s.ctx, f.wf.name, f); err != nil {
+		return &fs.PathError{Op: "lock", Path: f.wf.name, Err: err}
+	}
+	return nil
+}
 
-// Unlock implements billy.Locker as a no-op.
-func (f *sharedReadFile) Unlock() error { return nil }
+// Unlock implements billy.Locker; unlocking a lock not held is a no-op.
+func (f *sharedReadFile) Unlock() error {
+	if f.isClosed() {
+		return &fs.PathError{Op: "unlock", Path: f.wf.name, Err: fs.ErrClosed}
+	}
+	s := f.wf.fs
+	if err := s.locks.unlock(s.ctx, f.wf.name, f); err != nil {
+		return &fs.PathError{Op: "unlock", Path: f.wf.name, Err: err}
+	}
+	return nil
+}

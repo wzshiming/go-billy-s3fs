@@ -28,6 +28,7 @@ type readBackend interface {
 // readBackend: streamed from S3, a body cached in memory, or a body cached
 // in a local file.
 type readOnlyFile struct {
+	fs   *S3FS
 	name string
 	info fileInfo
 	back readBackend
@@ -48,6 +49,7 @@ var (
 func newReadFile(s *S3FS, p string, h *s3.HeadObjectOutput, body io.ReadCloser) *readOnlyFile {
 	info := infoFromHeadValue(path.Base(p), h)
 	return &readOnlyFile{
+		fs:   s,
 		name: p,
 		info: info,
 		back: &s3Backend{fs: s, key: s.key(p), size: info.size, body: body},
@@ -56,14 +58,14 @@ func newReadFile(s *S3FS, p string, h *s3.HeadObjectOutput, body io.ReadCloser) 
 
 // newMemReadFile returns a file over a body shared with the memory cache;
 // data must not be mutated.
-func newMemReadFile(name string, info fileInfo, data []byte) *readOnlyFile {
+func newMemReadFile(s *S3FS, name string, info fileInfo, data []byte) *readOnlyFile {
 	info.size = int64(len(data))
-	return &readOnlyFile{name: name, info: info, back: bytesBackend(data)}
+	return &readOnlyFile{fs: s, name: name, info: info, back: bytesBackend(data)}
 }
 
 // newDiskReadFile returns a file over a locally cached body, owning f.
-func newDiskReadFile(f *os.File, name string, info fileInfo) *readOnlyFile {
-	return &readOnlyFile{name: name, info: info, back: fileBackend{f}}
+func newDiskReadFile(s *S3FS, f *os.File, name string, info fileInfo) *readOnlyFile {
+	return &readOnlyFile{fs: s, name: name, info: info, back: fileBackend{f}}
 }
 
 func (f *readOnlyFile) Name() string { return f.name }
@@ -140,6 +142,7 @@ func (f *readOnlyFile) Close() error {
 		return &fs.PathError{Op: "close", Path: f.name, Err: fs.ErrClosed}
 	}
 	f.closed = true
+	f.fs.locks.releaseOnClose(f.fs.ctx, f.name, f)
 	return f.back.close()
 }
 
@@ -149,11 +152,28 @@ func (f *readOnlyFile) isClosed() bool {
 	return f.closed
 }
 
-// Lock implements billy.Locker as a no-op.
-func (f *readOnlyFile) Lock() error { return nil }
+// Lock implements billy.Locker with flock-like semantics: exclusive,
+// blocking, reentrant per handle and released on Close.
+func (f *readOnlyFile) Lock() error {
+	if f.isClosed() {
+		return &fs.PathError{Op: "lock", Path: f.name, Err: fs.ErrClosed}
+	}
+	if err := f.fs.locks.lock(f.fs.ctx, f.name, f); err != nil {
+		return &fs.PathError{Op: "lock", Path: f.name, Err: err}
+	}
+	return nil
+}
 
-// Unlock implements billy.Locker as a no-op.
-func (f *readOnlyFile) Unlock() error { return nil }
+// Unlock implements billy.Locker; unlocking a lock not held is a no-op.
+func (f *readOnlyFile) Unlock() error {
+	if f.isClosed() {
+		return &fs.PathError{Op: "unlock", Path: f.name, Err: fs.ErrClosed}
+	}
+	if err := f.fs.locks.unlock(f.fs.ctx, f.name, f); err != nil {
+		return &fs.PathError{Op: "unlock", Path: f.name, Err: err}
+	}
+	return nil
+}
 
 // seekPos resolves a Seek to an absolute position, rejecting negatives.
 func seekPos(pos, size, offset int64, whence int) (int64, error) {
