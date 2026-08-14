@@ -1,6 +1,9 @@
 package s3fs_test
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"io/fs"
@@ -21,13 +24,20 @@ import (
 	s3fs "github.com/wzshiming/go-billy-s3fs"
 )
 
-// doSigned performs the presigned request with the given body; the URL is
-// self-contained, so no extra headers are set.
-func doSigned(t *testing.T, method, url string, body io.Reader) *http.Response {
+// doSigned performs the presigned request with the given body and the
+// signed headers the request demands, if any.
+func doSigned(t *testing.T, method, url string, body io.Reader, header ...http.Header) *http.Response {
 	t.Helper()
 	httpReq, err := http.NewRequest(method, url, body)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, h := range header {
+		for k, vs := range h {
+			for _, v := range vs {
+				httpReq.Header.Add(k, v)
+			}
+		}
 	}
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
@@ -42,7 +52,7 @@ func TestPresignGet(t *testing.T) {
 			bfs := newTestFS(t, v.opts(t)...)
 			writeFull(t, bfs, "dir/data.txt", "signed content")
 
-			req, err := bfs.PresignGet("dir/data.txt", time.Minute)
+			req, err := bfs.PresignGet("dir/data.txt", s3fs.WithExpiry(time.Minute))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -72,7 +82,7 @@ func TestPresignGetFollowsSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req, err := bfs.PresignGet("link.txt", 0)
+	req, err := bfs.PresignGet("link.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,13 +104,13 @@ func TestPresignGetErrors(t *testing.T) {
 	bfs := newTestFS(t)
 	writeFull(t, bfs, "dir/data.txt", "x")
 
-	if _, err := bfs.PresignGet("missing.txt", 0); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := bfs.PresignGet("missing.txt"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("missing file: err = %v, want fs.ErrNotExist", err)
 	}
-	if _, err := bfs.PresignGet("dir", 0); !errors.Is(err, s3fs.ErrIsDirectory) {
+	if _, err := bfs.PresignGet("dir"); !errors.Is(err, s3fs.ErrIsDirectory) {
 		t.Fatalf("directory: err = %v, want ErrIsDirectory", err)
 	}
-	if _, err := bfs.PresignGet("/", 0); !errors.Is(err, s3fs.ErrIsDirectory) {
+	if _, err := bfs.PresignGet("/"); !errors.Is(err, s3fs.ErrIsDirectory) {
 		t.Fatalf("root: err = %v, want ErrIsDirectory", err)
 	}
 }
@@ -115,7 +125,7 @@ func TestPresignPut(t *testing.T) {
 				t.Fatalf("stat before upload: %v", err)
 			}
 
-			req, err := bfs.PresignPut("up/new.txt", time.Minute)
+			req, err := bfs.PresignPut("up/new.txt", s3fs.WithExpiry(time.Minute))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,6 +145,74 @@ func TestPresignPut(t *testing.T) {
 	}
 }
 
+// TestPresignPutContentSHA256 pins the upload to a content hash: the digest
+// must ride in the signature as the x-amz-checksum-sha256 header — a query
+// parameter could be swapped, an unsigned header dropped — and be handed to
+// the caller in SignedHeader for relaying to the uploader.
+func TestPresignPutContentSHA256(t *testing.T) {
+	bfs := newTestFS(t)
+	content := "hash-pinned body"
+	digest := sha256.Sum256([]byte(content))
+	b64 := base64.StdEncoding.EncodeToString(digest[:])
+
+	req, err := bfs.PresignPut("lfs/oid", s3fs.WithExpiry(time.Minute), s3fs.WithContentSHA256(b64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.SignedHeader.Get("x-amz-checksum-sha256"); got != b64 {
+		t.Fatalf("SignedHeader checksum = %q, want %q", got, b64)
+	}
+	u, err := url.Parse(req.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sh := u.Query().Get("X-Amz-SignedHeaders"); !strings.Contains(sh, "x-amz-checksum-sha256") {
+		t.Fatalf("signed headers = %q, missing x-amz-checksum-sha256", sh)
+	}
+
+	resp := doSigned(t, req.Method, req.URL, strings.NewReader(content), req.SignedHeader)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if got := readFull(t, bfs, "lfs/oid"); got != content {
+		t.Fatalf("content = %q, want %q", got, content)
+	}
+}
+
+// TestPresignPutContentSHA256Hex accepts the digest in hex — the sha256sum
+// and git-LFS OID format — and signs its base64 re-encoding, the only form
+// S3 validates.
+func TestPresignPutContentSHA256Hex(t *testing.T) {
+	bfs := newTestFS(t)
+	digest := sha256.Sum256([]byte("hex-pinned body"))
+
+	req, err := bfs.PresignPut("lfs/oid", s3fs.WithContentSHA256(hex.EncodeToString(digest[:])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := base64.StdEncoding.EncodeToString(digest[:])
+	if got := req.SignedHeader.Get("x-amz-checksum-sha256"); got != want {
+		t.Fatalf("SignedHeader checksum = %q, want %q", got, want)
+	}
+}
+
+// TestPresignPutContentSHA256Invalid rejects digests that are neither 64
+// hex chars nor the base64 of 32 raw bytes at sign time.
+func TestPresignPutContentSHA256Invalid(t *testing.T) {
+	bfs := newTestFS(t)
+	for _, sum := range []string{
+		"not base64!",
+		"c3Vt",                   // base64, but not 32 bytes
+		strings.Repeat("z", 64),  // digest-length but neither hex nor 32-byte base64
+		strings.Repeat("e3", 16), // valid hex, but only 16 bytes
+	} {
+		if _, err := bfs.PresignPut("lfs/oid", s3fs.WithContentSHA256(sum)); err == nil {
+			t.Fatalf("sum %q: expected error", sum)
+		}
+	}
+}
+
 func TestPresignPutOverwrite(t *testing.T) {
 	for _, v := range fsVariants {
 		t.Run(v.name, func(t *testing.T) {
@@ -144,7 +222,7 @@ func TestPresignPutOverwrite(t *testing.T) {
 				t.Fatalf("content = %q", got)
 			}
 
-			req, err := bfs.PresignPut("file.txt", 0)
+			req, err := bfs.PresignPut("file.txt")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -164,10 +242,10 @@ func TestPresignPutErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := bfs.PresignPut("dir", 0); !errors.Is(err, s3fs.ErrIsDirectory) {
+	if _, err := bfs.PresignPut("dir"); !errors.Is(err, s3fs.ErrIsDirectory) {
 		t.Fatalf("directory: err = %v, want ErrIsDirectory", err)
 	}
-	if _, err := bfs.PresignPut("/", 0); !errors.Is(err, s3fs.ErrIsDirectory) {
+	if _, err := bfs.PresignPut("/"); !errors.Is(err, s3fs.ErrIsDirectory) {
 		t.Fatalf("root: err = %v, want ErrIsDirectory", err)
 	}
 }
@@ -182,7 +260,7 @@ func TestPresignerAssert(t *testing.T) {
 	if !ok {
 		t.Fatal("*S3FS does not satisfy s3fs.Presigner")
 	}
-	req, err := p.PresignGet("a.txt", 0)
+	req, err := p.PresignGet("a.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,10 +272,10 @@ func TestPresignerAssert(t *testing.T) {
 // TestPresignNoClient verifies presigning is an opt-in dependency.
 func TestPresignNoClient(t *testing.T) {
 	bfs := s3fs.New(testBucket, s3fs.WithClient(newTestClient(t)))
-	if _, err := bfs.PresignGet("a.txt", 0); !errors.Is(err, s3fs.ErrNoPresignClient) {
+	if _, err := bfs.PresignGet("a.txt"); !errors.Is(err, s3fs.ErrNoPresignClient) {
 		t.Fatalf("PresignGet err = %v, want ErrNoPresignClient", err)
 	}
-	if _, err := bfs.PresignPut("a.txt", 0); !errors.Is(err, s3fs.ErrNoPresignClient) {
+	if _, err := bfs.PresignPut("a.txt"); !errors.Is(err, s3fs.ErrNoPresignClient) {
 		t.Fatalf("PresignPut err = %v, want ErrNoPresignClient", err)
 	}
 }
@@ -216,9 +294,12 @@ func TestPresignPureURL(t *testing.T) {
 		s3fs.WithClient(client),
 		s3fs.WithPresignClient(s3.NewPresignClient(client)))
 
-	req, err := bfs.PresignPut("pure.txt", 0)
+	req, err := bfs.PresignPut("pure.txt")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(req.SignedHeader) != 0 {
+		t.Fatalf("SignedHeader = %v, want empty for a plain URL", req.SignedHeader)
 	}
 	u, err := url.Parse(req.URL)
 	if err != nil {
@@ -233,9 +314,12 @@ func TestPresignPureURL(t *testing.T) {
 		t.Fatalf("content = %q, want %q", got, "pure")
 	}
 
-	greq, err := bfs.PresignGet("pure.txt", 0)
+	greq, err := bfs.PresignGet("pure.txt")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(greq.SignedHeader) != 0 {
+		t.Fatalf("SignedHeader = %v, want empty for a plain URL", greq.SignedHeader)
 	}
 	gu, err := url.Parse(greq.URL)
 	if err != nil {
@@ -271,7 +355,7 @@ func TestPresignEndpoint(t *testing.T) {
 		s3fs.WithClient(client),
 		s3fs.WithPresignClient(s3.NewPresignClient(client, s3fs.WithPresignEndpoint(public.URL))))
 
-	req, err := bfs.PresignPut("a.txt", 0)
+	req, err := bfs.PresignPut("a.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +368,7 @@ func TestPresignEndpoint(t *testing.T) {
 		t.Fatalf("content = %q, want %q", got, "via public")
 	}
 
-	greq, err := bfs.PresignGet("a.txt", 0)
+	greq, err := bfs.PresignGet("a.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +390,7 @@ func TestPresignExpiry(t *testing.T) {
 	bfs := newTestFS(t)
 	writeFull(t, bfs, "a.txt", "content")
 
-	req, err := bfs.PresignGet("a.txt", 2*time.Hour)
+	req, err := bfs.PresignGet("a.txt", s3fs.WithExpiry(2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
