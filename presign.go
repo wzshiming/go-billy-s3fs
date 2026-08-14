@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -96,14 +97,31 @@ type contentSHA256Option string
 func (o contentSHA256Option) applyPresignPut(c *presignConfig) { c.contentSHA256 = string(o) }
 
 // WithContentSHA256 ties a PresignPut grant to its expected content: sum
-// is the SHA256 of the bytes to be uploaded, base64-encoded (the S3
-// ChecksumSHA256 format; e.g. a git-LFS OID re-encoded from hex). S3 then
-// rejects any upload whose body does not hash to sum. The digest travels
-// as the signed x-amz-checksum-sha256 header, so the upload is no longer
-// a bare PUT: the headers in PresignedRequest.SignedHeader must be sent
-// with it.
+// is the SHA256 of the bytes to be uploaded, either 64 hex chars (the
+// sha256sum and git-LFS OID format) or the base64 of the 32 raw digest
+// bytes (the S3 ChecksumSHA256 format, which hex is re-encoded to at sign
+// time). S3 then rejects any upload whose body does not hash to sum. The
+// digest travels as the signed x-amz-checksum-sha256 header, so the
+// upload is no longer a bare PUT: the headers in
+// PresignedRequest.SignedHeader must be sent with it.
 func WithContentSHA256(sum string) PresignPutOption {
 	return contentSHA256Option(sum)
+}
+
+// normalizeSHA256 brings a digest in either accepted encoding into the
+// base64 form S3 validates, catching malformed digests at sign time
+// instead of as an S3 error on the upload holder's side.
+func normalizeSHA256(sum string) (string, error) {
+	if len(sum) == hex.EncodedLen(sha256.Size) {
+		if d, err := hex.DecodeString(sum); err == nil {
+			return base64.StdEncoding.EncodeToString(d), nil
+		}
+		// 64 chars can still be valid base64, though never of 32 bytes
+	}
+	if d, err := base64.StdEncoding.DecodeString(sum); err == nil && len(d) == sha256.Size {
+		return sum, nil
+	}
+	return "", fmt.Errorf("content sha256 %q: want 64 hex chars or the base64 of the 32 raw digest bytes", sum)
 }
 
 // WithPresignEndpoint is an s3.NewPresignClient option that signs URLs
@@ -257,13 +275,11 @@ func (s *S3FS) PresignPut(filename string, opts ...PresignPutOption) (*Presigned
 	}
 	popts := []func(*s3.PresignOptions){presignOpts(cfg.expiry)}
 	if cfg.contentSHA256 != "" {
-		// catch digest mistakes (hex instead of base64, truncation) at
-		// sign time instead of as an S3 error on the upload holder's side
-		if d, err := base64.StdEncoding.DecodeString(cfg.contentSHA256); err != nil || len(d) != sha256.Size {
-			return nil, &fs.PathError{Op: "presignput", Path: filename,
-				Err: fmt.Errorf("content sha256 %q: want the base64 of the 32 raw digest bytes", cfg.contentSHA256)}
+		sum, err := normalizeSHA256(cfg.contentSHA256)
+		if err != nil {
+			return nil, &fs.PathError{Op: "presignput", Path: filename, Err: err}
 		}
-		in.ChecksumSHA256 = aws.String(cfg.contentSHA256)
+		in.ChecksumSHA256 = aws.String(sum)
 		popts = append(popts, withSignedChecksumHeader)
 	}
 	out, err := s.presignClient.PresignPutObject(s.ctx, in, popts...)

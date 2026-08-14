@@ -3,6 +3,7 @@ package s3fs_test
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"io/fs"
@@ -179,16 +180,32 @@ func TestPresignPutContentSHA256(t *testing.T) {
 	}
 }
 
-// TestPresignPutContentSHA256Invalid rejects digests that are not the
-// base64 of 32 raw bytes at sign time — notably a hex-encoded digest, the
-// format checksums are usually quoted in.
+// TestPresignPutContentSHA256Hex accepts the digest in hex — the sha256sum
+// and git-LFS OID format — and signs its base64 re-encoding, the only form
+// S3 validates.
+func TestPresignPutContentSHA256Hex(t *testing.T) {
+	bfs := newTestFS(t)
+	digest := sha256.Sum256([]byte("hex-pinned body"))
+
+	req, err := bfs.PresignPut("lfs/oid", s3fs.WithContentSHA256(hex.EncodeToString(digest[:])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := base64.StdEncoding.EncodeToString(digest[:])
+	if got := req.SignedHeader.Get("x-amz-checksum-sha256"); got != want {
+		t.Fatalf("SignedHeader checksum = %q, want %q", got, want)
+	}
+}
+
+// TestPresignPutContentSHA256Invalid rejects digests that are neither 64
+// hex chars nor the base64 of 32 raw bytes at sign time.
 func TestPresignPutContentSHA256Invalid(t *testing.T) {
 	bfs := newTestFS(t)
 	for _, sum := range []string{
 		"not base64!",
-		"c3Vt", // base64, but not 32 bytes
-		// hex digest: valid base64 chars, but 64 of them decode to 48 bytes
-		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		"c3Vt",                   // base64, but not 32 bytes
+		strings.Repeat("z", 64),  // digest-length but neither hex nor 32-byte base64
+		strings.Repeat("e3", 16), // valid hex, but only 16 bytes
 	} {
 		if _, err := bfs.PresignPut("lfs/oid", s3fs.WithContentSHA256(sum)); err == nil {
 			t.Fatalf("sum %q: expected error", sum)
