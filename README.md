@@ -44,6 +44,13 @@ fs := s3fs.New("bucket",
 	s3fs.WithPresignClient(s3.NewPresignClient(client, s3fs.WithPresignEndpoint("https://s3.example.com"))),
 )
 
-req, err := fs.PresignGet("objects/pack/pack-1234.pack", 15*time.Minute) // or PresignPut for uploads
+req, err := fs.PresignGet("objects/pack/pack-1234.pack", s3fs.WithExpiry(15*time.Minute)) // or PresignPut for uploads
 // http.Redirect(w, r, req.URL, http.StatusTemporaryRedirect)
+```
+
+A plain `PresignPut` URL accepts whatever its holder uploads. `WithContentSHA256` pins the grant to an expected content hash — S3 rejects any body that does not match — at the cost of the URL's self-containedness: the digest travels in a signed header, returned in `req.SignedHeader`, that the uploader must send along (e.g. relayed in the `header` map of a git-LFS batch action):
+
+```go
+req, err := fs.PresignPut("objects/ab/cd/oid", s3fs.WithContentSHA256(base64OfSHA256))
+// upload with: PUT req.URL + headers req.SignedHeader
 ```
